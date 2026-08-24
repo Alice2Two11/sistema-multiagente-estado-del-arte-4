@@ -453,15 +453,41 @@ def validate_agent07_runtime_result_contract(value: Agent07RuntimeResult | Mappi
     # fixture en el repo construye un record sin ella.
     required_agentic_retrieval_fields={"planner_invoked","outcome","final_observation","steps","initial_grade_result","original_max_additional_retrieval_requests","agentic_additional_retrievals_used","effective_budget_for_verify_claim","trace"}
     for row in records:
-        if not isinstance(row, Mapping) or set(row)!=required_record_fields: raise ValueError("AGENT07_RUNTIME_INDEPENDENT_RAG_RECORD_INVALID")
+        if not isinstance(row, Mapping) or set(row)!=required_record_fields:
+            # E2E-DIAG-03: instrumentación temporal, solo diagnóstico.
+            row_set = set(row) if isinstance(row, Mapping) else set()
+            print(
+                "AGENT07_RUNTIME_INDEPENDENT_RAG_RECORD_INVALID:FIELD_SET",
+                "row_fields=", sorted(row_set),
+                "required_fields=", sorted(required_record_fields),
+                "extra_in_row=", sorted(row_set - required_record_fields),
+                "missing_from_row=", sorted(required_record_fields - row_set),
+                "claim_id=", row.get("claim_id") if isinstance(row, Mapping) else None,
+                "section_id=", row.get("section_id") if isinstance(row, Mapping) else None,
+            )
+            raise ValueError("AGENT07_RUNTIME_INDEPENDENT_RAG_RECORD_INVALID:FIELD_SET")
         row=dict(row); ident=(row["section_id"],row["claim_id"])
-        if not all(isinstance(row[k],str) and row[k] for k in ("claim_id","section_id")): raise ValueError("AGENT07_RUNTIME_INDEPENDENT_RAG_RECORD_INVALID")
+        if not all(isinstance(row[k],str) and row[k] for k in ("claim_id","section_id")):
+            # E2E-DIAG-03: instrumentación temporal, solo diagnóstico.
+            print(
+                "AGENT07_RUNTIME_INDEPENDENT_RAG_RECORD_INVALID:IDENTITY",
+                "claim_id=", repr(row.get("claim_id")), type(row.get("claim_id")).__name__,
+                "section_id=", repr(row.get("section_id")), type(row.get("section_id")).__name__,
+            )
+            raise ValueError("AGENT07_RUNTIME_INDEPENDENT_RAG_RECORD_INVALID:IDENTITY")
         if ident in identities: raise ValueError("AGENT07_RUNTIME_INDEPENDENT_RAG_RECORD_DUPLICATE")
         identities.add(ident)
         if type(row["retrieval_requested"]) is not int or row["retrieval_requested"] < 1 or type(row["retrieval_rounds"]) is not int or row["retrieval_rounds"] < 1: raise ValueError("AGENT07_RUNTIME_INDEPENDENT_RAG_RECORD_NOT_RETRIEVED")
         if row["retrieval_status"] not in {"COMPLETED_WITH_RESULTS","COMPLETED_NO_RESULTS"}: raise ValueError("AGENT07_RUNTIME_INDEPENDENT_RAG_STATUS_INVALID")
         validate_sha256_hex(row["retriever_binding_fingerprint"], field="retriever_binding_fingerprint")
-        if type(row["retrieved_candidate_ids"]) not in (tuple,list) or any(not isinstance(x,str) or not x for x in row["retrieved_candidate_ids"]): raise ValueError("AGENT07_RUNTIME_INDEPENDENT_RAG_RECORD_INVALID")
+        if type(row["retrieved_candidate_ids"]) not in (tuple,list) or any(not isinstance(x,str) or not x for x in row["retrieved_candidate_ids"]):
+            # E2E-DIAG-03: instrumentación temporal, solo diagnóstico.
+            print(
+                "AGENT07_RUNTIME_INDEPENDENT_RAG_RECORD_INVALID:CANDIDATE_IDS",
+                "retrieved_candidate_ids=", repr(row["retrieved_candidate_ids"]),
+                "element_types=", [type(x).__name__ for x in row["retrieved_candidate_ids"]] if type(row["retrieved_candidate_ids"]) in (tuple, list) else "N/A (not tuple/list)",
+            )
+            raise ValueError("AGENT07_RUNTIME_INDEPENDENT_RAG_RECORD_INVALID:CANDIDATE_IDS")
         candidate_records=row["retrieved_candidate_records"]
         if type(candidate_records) not in (tuple,list): raise ValueError("AGENT07_RUNTIME_INDEPENDENT_RAG_CANDIDATES_INVALID")
         normalized_candidates=[]
@@ -1084,6 +1110,11 @@ def run_agent07_in_memory(runtime_input: Agent07RuntimeInput, *, dependencies: V
                 valid_evidence = eligible_ids.issubset(source_ids) and used_ids.union(rejected_ids).issubset(source_ids)
             if valid_evidence and verification.get("result_contract_valid") is True:
                 evidence_candidate_validation_claims += 1
+        # E2E-DIAG-03: instrumentación temporal -- evita que el audit
+        # atribuya erróneamente el error a MULTI_PROPOSAL_RESOLUTION si
+        # la excepción real ocurre dentro de create_agent07_runtime_result
+        # (validación del contrato), no en resolution_runner.
+        stage = "RUNTIME_RESULT_BUILD"
         return create_agent07_runtime_result(provisional_bundle=bundle,multi_proposal_resolution_result=resolution,candidate_artifact_inventory=_candidate_inventory(bundle,resolution,validated["schema_versions"]),execution_metrics=_base_metrics(claims_processed=len(vr),independent_rag_claims=independent_rag_claims,independent_rag_claims_with_results=independent_rag_claims_with_results,independent_rag_claims_without_results=independent_rag_claims_without_results,independent_rag_claim_records=tuple(independent_rag_records),evidence_candidate_validation_claims=evidence_candidate_validation_claims,correction_proposals=len(proposals),reverification_inputs=len(ri),prechecks=len(pre),reverifications=len(rev),comparisons=len(comp)),runtime_warnings=(),runtime_issue_codes=(),runtime_error_records=(),blocked_runtime_audit_record=None,runtime_status=_resolution_to_runtime_status(resolution["resolution_status"]),correction_applied=False,official_artifacts_created=False,evaluation_ready_emitted=False)
     except Exception as exc:
         # E2E-DIAG-02: instrumentación temporal, solo diagnóstico -- no
