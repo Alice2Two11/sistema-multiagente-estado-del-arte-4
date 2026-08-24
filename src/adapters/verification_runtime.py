@@ -442,7 +442,16 @@ def validate_agent07_runtime_result_contract(value: Agent07RuntimeResult | Mappi
     records = metrics["independent_rag_claim_records"]
     if type(records) not in (tuple, list): raise ValueError("AGENT07_RUNTIME_INDEPENDENT_RAG_RECORDS_INVALID")
     normalized_records=[]; identities=set(); with_results=0; without_results=0
-    required_record_fields={"claim_id","section_id","retrieval_requested","retrieval_rounds","retrieval_status","retriever_binding_fingerprint","retrieved_candidate_ids","retrieved_candidate_records","verification_context_snapshot"}
+    required_record_fields={"claim_id","section_id","retrieval_requested","retrieval_rounds","retrieval_status","retriever_binding_fingerprint","retrieved_candidate_ids","retrieved_candidate_records","verification_context_snapshot","agentic_retrieval"}
+    # E2E-BUG-02: "agentic_retrieval" es OBLIGATORIO -- confirmado por
+    # auditoría que _independent_retrieve_claim es el ÚNICO productor
+    # real de estos records (solo se invoca cuando dependencies.
+    # retrieval_tool/retriever_binding existen; si no existen, no se
+    # agrega ningún record para ese claim -- nunca un record "legacy"
+    # sin agentic_retrieval) y SIEMPRE incluye esta clave, tanto en el
+    # caso SUFFICIENT inicial como en el ciclo completo. Ningún test/
+    # fixture en el repo construye un record sin ella.
+    required_agentic_retrieval_fields={"planner_invoked","outcome","final_observation","steps","initial_grade_result","original_max_additional_retrieval_requests","agentic_additional_retrievals_used","effective_budget_for_verify_claim","trace"}
     for row in records:
         if not isinstance(row, Mapping) or set(row)!=required_record_fields: raise ValueError("AGENT07_RUNTIME_INDEPENDENT_RAG_RECORD_INVALID")
         row=dict(row); ident=(row["section_id"],row["claim_id"])
@@ -464,6 +473,23 @@ def validate_agent07_runtime_result_contract(value: Agent07RuntimeResult | Mappi
             validate_sha256_hex(candidate["text_fingerprint"], field="text_fingerprint")
             if type(candidate["query_ids"]) not in (tuple,list) or row["claim_id"] not in tuple(str(x) for x in candidate["query_ids"]): raise ValueError("AGENT07_RUNTIME_INDEPENDENT_RETRIEVAL_CLAIM_MISMATCH")
             candidate["query_ids"]=tuple(str(x) for x in candidate["query_ids"]); normalized_candidates.append(candidate)
+        agentic = row["agentic_retrieval"]
+        if not isinstance(agentic, Mapping) or set(agentic) != required_agentic_retrieval_fields: raise ValueError("AGENT07_RUNTIME_AGENTIC_RETRIEVAL_RECORD_INVALID")
+        agentic = dict(agentic)
+        if not isinstance(agentic["planner_invoked"], bool): raise ValueError("AGENT07_RUNTIME_AGENTIC_RETRIEVAL_RECORD_INVALID")
+        if agentic["outcome"] is not None and not isinstance(agentic["outcome"], str): raise ValueError("AGENT07_RUNTIME_AGENTIC_RETRIEVAL_RECORD_INVALID")
+        if agentic["initial_grade_result"] not in ("SUFFICIENT", "INSUFFICIENT"): raise ValueError("AGENT07_RUNTIME_AGENTIC_RETRIEVAL_RECORD_INVALID")
+        if type(agentic["steps"]) not in (tuple, list): raise ValueError("AGENT07_RUNTIME_AGENTIC_RETRIEVAL_RECORD_INVALID")
+        if not isinstance(agentic["trace"], Mapping): raise ValueError("AGENT07_RUNTIME_AGENTIC_RETRIEVAL_RECORD_INVALID")
+        try:
+            expected_effective_budget = compute_effective_budget_for_verify_claim(
+                original_max_additional_retrieval_requests=agentic["original_max_additional_retrieval_requests"],
+                agentic_additional_retrievals_used=agentic["agentic_additional_retrievals_used"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"AGENT07_RUNTIME_AGENTIC_RETRIEVAL_BUDGET_INVALID: {exc}") from exc
+        if type(agentic["effective_budget_for_verify_claim"]) is not int or isinstance(agentic["effective_budget_for_verify_claim"], bool) or agentic["effective_budget_for_verify_claim"] != expected_effective_budget:
+            raise ValueError("AGENT07_RUNTIME_AGENTIC_RETRIEVAL_BUDGET_MISMATCH")
         by_id={}; by_pair={}
         for candidate in normalized_candidates:
             canonical=json.dumps(candidate,ensure_ascii=False,sort_keys=True,separators=(",",":"),allow_nan=False)
