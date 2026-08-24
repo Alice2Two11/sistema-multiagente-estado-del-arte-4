@@ -804,7 +804,15 @@ def run_agentic_retrieval_cycle(
         observation_before = observation
         try:
             observation_after = execute_action_fn(selected_action, decision_basis, observation_before)
-        except AgenticRetrievalActionUnavailable:
+        except AgenticRetrievalActionUnavailable as exc:
+            # E2E-DIAG-02: instrumentación temporal, solo diagnóstico --
+            # no cambia lógica ni contratos, no captura nada nuevo.
+            print(
+                "AGENTIC_ACTION_UNAVAILABLE_CAUGHT",
+                type(exc).__module__,
+                type(exc).__qualname__,
+                repr(exc),
+            )
             # La acción era legal para esta Observation, pero no pudo
             # ejecutarse con los datos concretos disponibles -- NO
             # consume budget/round (no hubo retrieval, no hay nueva

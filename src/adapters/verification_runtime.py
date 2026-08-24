@@ -1060,4 +1060,13 @@ def run_agent07_in_memory(runtime_input: Agent07RuntimeInput, *, dependencies: V
                 evidence_candidate_validation_claims += 1
         return create_agent07_runtime_result(provisional_bundle=bundle,multi_proposal_resolution_result=resolution,candidate_artifact_inventory=_candidate_inventory(bundle,resolution,validated["schema_versions"]),execution_metrics=_base_metrics(claims_processed=len(vr),independent_rag_claims=independent_rag_claims,independent_rag_claims_with_results=independent_rag_claims_with_results,independent_rag_claims_without_results=independent_rag_claims_without_results,independent_rag_claim_records=tuple(independent_rag_records),evidence_candidate_validation_claims=evidence_candidate_validation_claims,correction_proposals=len(proposals),reverification_inputs=len(ri),prechecks=len(pre),reverifications=len(rev),comparisons=len(comp)),runtime_warnings=(),runtime_issue_codes=(),runtime_error_records=(),blocked_runtime_audit_record=None,runtime_status=_resolution_to_runtime_status(resolution["resolution_status"]),correction_applied=False,official_artifacts_created=False,evaluation_ready_emitted=False)
     except Exception as exc:
+        # E2E-DIAG-02: instrumentación temporal, solo diagnóstico -- no
+        # cambia lógica ni contratos, no convierte ni captura nada nuevo.
+        print(
+            "AGENT07_EXCEPTION_DEBUG",
+            type(exc).__module__,
+            type(exc).__qualname__,
+            repr(exc),
+            str(exc),
+        )
         return _blocked_runtime_result(stage=stage,claim_id=claim_id,section_id=section_id,error_code=_sanitized_stage_error_code(exc),classification="DEPENDENCY" if stage in {"AGENT_INITIALIZATION","BUNDLE_BUILD","MULTI_PROPOSAL_RESOLUTION"} else "TECHNICAL",schema_versions=validated["schema_versions"],metrics=_base_metrics(claims_processed=len(vr),correction_proposals=len(proposals),reverification_inputs=len(ri),prechecks=len(pre),reverifications=len(rev),comparisons=len(comp)))
