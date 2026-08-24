@@ -571,6 +571,24 @@ def invoke_agentic_planner_with_retry(
 AGENTIC_TRANSITION_INVALID = "AGENTIC_TRANSITION_INVALID"
 
 
+class AgenticRetrievalActionUnavailable(Exception):
+    """E2E-BUG-01 (contract fix): excepción tipada de integración -- la
+    acción seleccionada era legal según ``compute_allowed_actions`` para
+    la Observation actual, pero no puede ejecutarse con los datos
+    concretos disponibles (ej. ``generate_query_rewrite`` sin
+    vocabulario nuevo genuino que incorporar). NO significa fallo
+    técnico global, claim unsupported, presupuesto agotado, transición
+    inválida ni fallo del planner -- el executor (Bloque 4/runtime) es
+    responsable de traducir la condición legítima específica
+    (``QUERY_REWRITE_UNAVAILABLE``) a esta excepción; cualquier otro
+    error debe seguir propagándose sin conversión."""
+
+
+EXECUTION_STATUS_EXECUTED = "EXECUTED"
+EXECUTION_STATUS_ACTION_UNAVAILABLE = "ACTION_UNAVAILABLE"
+EXECUTION_STATUS_TERMINAL = "TERMINAL"
+
+
 def _validate_improvement_transition(
     *, action: str, before: AgenticRetrievalObservation, after: AgenticRetrievalObservation
 ) -> None:
@@ -716,6 +734,13 @@ def run_agentic_retrieval_cycle(
     compartido o el contrato de la acción."""
     observation = initial_observation
     steps: list[dict[str, Any]] = []
+    # E2E-BUG-01: exclusiones LOCALES a la Observation actual -- una
+    # acción legal según compute_allowed_actions puede resultar no
+    # ejecutable con los datos concretos disponibles (ver
+    # AgenticRetrievalActionUnavailable). Se reinicia en cuanto se
+    # obtiene una nueva Observation real (evidencia distinta puede
+    # volver viable una acción que antes no lo era).
+    unavailable_actions_for_current_observation: set[str] = set()
 
     while True:
         forced_outcome = determine_forced_outcome(observation)
@@ -724,21 +749,30 @@ def run_agentic_retrieval_cycle(
                 claim_id=observation.claim_id, outcome=forced_outcome, steps=steps, final_observation=observation,
             )
 
-        allowed_actions = compute_allowed_actions(observation)
+        allowed_actions = tuple(
+            a for a in compute_allowed_actions(observation)
+            if a not in unavailable_actions_for_current_observation
+        )
         if not allowed_actions:
-            # Salvaguarda -- no debería alcanzarse dado determine_forced_outcome,
-            # pero fail-closed explícito si ocurriera igual.
+            # 0 acciones efectivas -- ya sea porque compute_allowed_actions
+            # no ofrecía ninguna (salvaguarda, no debería alcanzarse dado
+            # determine_forced_outcome) o porque todas las legales
+            # resultaron ACTION_UNAVAILABLE para esta Observation.
             return AgenticRetrievalResult(
                 claim_id=observation.claim_id, outcome=FINISH_UNRESOLVED, steps=steps, final_observation=observation,
             )
 
         if len(allowed_actions) == 1:
-            # Una sola acción válida -- Python ya sabe qué hacer, el
-            # planner NUNCA se invoca.
+            # Una sola acción efectiva -- Python ya sabe qué hacer, el
+            # planner NUNCA se invoca (ni siquiera una segunda vez tras
+            # descartar una acción no ejecutable).
             selected_action = allowed_actions[0]
             decision_basis = _infer_deterministic_decision_basis(observation)
             planner_invoked = False
         else:
+            # El prompt se construye con allowed_actions_effective -- el
+            # planner nunca puede volver a elegir una acción ya marcada
+            # no ejecutable para esta misma Observation.
             prompt = build_agentic_planner_prompt(observation=observation, allowed_actions=allowed_actions)
             try:
                 decision = invoke_agentic_planner_with_retry(
@@ -754,20 +788,52 @@ def run_agentic_retrieval_cycle(
             planner_invoked = True
 
         step_number = len(steps) + 1
-        steps.append({
-            "step_number": step_number,
-            "selected_action": selected_action,
-            "decision_basis": decision_basis,
-            "planner_invoked": planner_invoked,
-        })
 
         if selected_action == "ACCEPT_EVIDENCE":
+            steps.append({
+                "step_number": step_number,
+                "selected_action": selected_action,
+                "decision_basis": decision_basis,
+                "planner_invoked": planner_invoked,
+                "execution_status": EXECUTION_STATUS_TERMINAL,
+            })
             return AgenticRetrievalResult(
                 claim_id=observation.claim_id, outcome="ACCEPT_EVIDENCE", steps=steps, final_observation=observation,
             )
 
         observation_before = observation
-        observation_after = execute_action_fn(selected_action, decision_basis, observation_before)
+        try:
+            observation_after = execute_action_fn(selected_action, decision_basis, observation_before)
+        except AgenticRetrievalActionUnavailable:
+            # La acción era legal para esta Observation, pero no pudo
+            # ejecutarse con los datos concretos disponibles -- NO
+            # consume budget/round (no hubo retrieval, no hay nueva
+            # Observation), NO aparece como retrieval_transition
+            # (Bloque 6 -- nunca se llega a construir una), pero SÍ
+            # queda auditada en decision_steps. Se excluye SOLO para
+            # esta Observation -- el bucle vuelve a evaluar
+            # allowed_actions_effective sin ella, sin avanzar
+            # observation, sin volver a intentarla indefinidamente
+            # (queda en unavailable_actions_for_current_observation
+            # hasta la próxima Observation real).
+            steps.append({
+                "step_number": step_number,
+                "selected_action": selected_action,
+                "decision_basis": decision_basis,
+                "planner_invoked": planner_invoked,
+                "execution_status": EXECUTION_STATUS_ACTION_UNAVAILABLE,
+            })
+            unavailable_actions_for_current_observation.add(selected_action)
+            continue
+
+        steps.append({
+            "step_number": step_number,
+            "selected_action": selected_action,
+            "decision_basis": decision_basis,
+            "planner_invoked": planner_invoked,
+            "execution_status": EXECUTION_STATUS_EXECUTED,
+        })
+
         try:
             _validate_improvement_transition(action=selected_action, before=observation_before, after=observation_after)
         except ValueError:
@@ -776,3 +842,4 @@ def run_agentic_retrieval_cycle(
                 steps=steps, final_observation=observation_before,
             )
         observation = observation_after
+        unavailable_actions_for_current_observation = set()

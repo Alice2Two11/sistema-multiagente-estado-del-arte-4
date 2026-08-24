@@ -80,11 +80,12 @@ from src.config.agentic_retrieval_policy_config import (
     next_top_k,
 )
 from src.tools.verification.agentic_retrieval_controller import (
+    AgenticRetrievalActionUnavailable,
     AgenticRetrievalObservation,
     validate_decision_basis,
 )
 from src.tools.verification.agentic_retrieval_grader import grade_evidence, is_minimum_viable_evidence
-from src.tools.verification.agentic_retrieval_query_rewrite import generate_query_rewrite
+from src.tools.verification.agentic_retrieval_query_rewrite import QueryRewriteError, generate_query_rewrite
 
 
 class ActionExecutorError(ValueError):
@@ -237,14 +238,30 @@ class AgenticRetrievalActionExecutor:
     def _execute_rewrite_query(
         self, rewrite_reason: str, observation: AgenticRetrievalObservation
     ) -> AgenticRetrievalObservation:
-        rewrite = generate_query_rewrite(
-            claim_text=self._claim_text,
-            current_query=observation.current_query,
-            reason_codes=observation.reason_codes,
-            rewrite_reason=rewrite_reason,
-            candidates=self._current_candidates,
-            authorized_sources=self._allowed_source_filenames,
-        )
+        try:
+            rewrite = generate_query_rewrite(
+                claim_text=self._claim_text,
+                current_query=observation.current_query,
+                reason_codes=observation.reason_codes,
+                rewrite_reason=rewrite_reason,
+                candidates=self._current_candidates,
+                authorized_sources=self._allowed_source_filenames,
+            )
+        except QueryRewriteError as exc:
+            # E2E-BUG-01 (contract fix): SOLO la condición legítima
+            # "sin vocabulario nuevo genuino que incorporar" se traduce a
+            # ACTION_UNAVAILABLE -- REWRITE_QUERY era legal según la
+            # Observation, pero no ejecutable con estos datos concretos.
+            # Cualquier otro QueryRewriteError (inputs inválidos,
+            # authorized_sources vacío, violación de contrato) sigue
+            # propagándose como error técnico/contractual real, sin
+            # conversión -- distinguido por el único código estable
+            # disponible en el mensaje (no existe todavía un tipo/campo
+            # estructurado separado en Bloque 3 para esta condición
+            # específica).
+            if str(exc).startswith("QUERY_REWRITE_UNAVAILABLE"):
+                raise AgenticRetrievalActionUnavailable(str(exc)) from exc
+            raise
 
         effective_query = rewrite["rewritten_query"]
         new_observation = self._run_retrieval_and_build_observation(
