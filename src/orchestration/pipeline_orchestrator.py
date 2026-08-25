@@ -425,7 +425,7 @@ def _draft_runtime_transaction(
         agent, agent_input = build_execution()
         result = agent.execute(agent_input)
         fingerprints = build_draft_fingerprints(agent_input)
-    except Exception as exc:  # noqa: BLE001 - convertido a AgentResult FAILED
+    except Exception as exc:  # AgentResult FAILED
         text = str(exc)
         if isinstance(exc, FileNotFoundError):
             code = "DEPENDENCY_NOT_FOUND"
@@ -502,18 +502,12 @@ def _quantitative_runtime_transaction(
 
 
 # ---------------------------------------------------------------------------
-# Ejecución dedicada de la etapa 07 (no encaja en build_execution +
-# runtime_transaction + resolve_resume genéricos — ver StageSpec.custom_run)
+# Ejecución dedicada de la etapa 07 
 # ---------------------------------------------------------------------------
 #
-# A diferencia de 02-06, la etapa 07 ya trae su propia semántica de RESUME
-# más rica que {NO_PENDING, COMMITTED, REEXECUTE}
-# (resume_agent07_execution devuelve COMMITTED, EXECUTED_NOT_COMMITTED,
-# REEXECUTE, NO_COMMIT, FINGERPRINT_MISMATCH, ARTIFACT_MISMATCH o
-# MANIFEST_INCOMPLETE — ver src/adapters/verification_notebook.py). Esa misma
-# función YA decide internamente si el resultado comprometido sigue vigente
-# (compara fingerprints), así que aquí no se duplica ese chequeo: se llama
-# siempre, incluso sin pending_execution, y se interpreta su resultado.
+# Ejecuta y controla la etapa 07 de verificación, permitiendo reanudar
+# ejecuciones previas, reutilizar resultados vigentes o repetir la etapa
+# cuando existen cambios, inconsistencias o artefactos incompletos.
 
 
 def _run_verification_stage(
@@ -537,12 +531,8 @@ def _run_verification_stage(
 
     try:
         dependencies, runtime_input = spec.build_execution(project_dir, attempt_number)
-    except Exception as exc:  # noqa: BLE001
-        # Ocurre ANTES de cualquier PREPARE (build_execution no toca
-        # StateStore) — a diferencia de 02-06, aquí no se fabrica un
-        # AgentResult FAILED sintético para no inventar comportamiento que
-        # verification_notebook.py no tiene. Se deja como excepción real,
-        # capturada por el try/except genérico de run_stage.
+    except Exception as exc: 
+       
         raise
 
     def _do_fresh_execution() -> AgentResult:
@@ -582,7 +572,7 @@ def _run_verification_stage(
                 if result.execution_status == ExecutionStatus.COMPLETED
                 else "FAILED"
             )
-        else:  # pragma: no cover - RESUME_ACTIONS es cerrado en el repo real
+        else:  
             raise RuntimeError(
                 f"resume_agent07_execution devolvió una acción inesperada: {resume.action}"
             )
@@ -590,6 +580,7 @@ def _run_verification_stage(
     state = store.load()
     attempts_used = state.stages[spec.key].attempts_used
     return _outcome_from_result(spec, result, status, attempts_used=attempts_used)
+
 
 
 # ---------------------------------------------------------------------------
