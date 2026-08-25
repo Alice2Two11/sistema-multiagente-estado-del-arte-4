@@ -827,12 +827,12 @@ def run_stage(
     observations: Mapping[str, Any] | None = None,
     force_rerun: bool = False,
 ) -> StageOutcome:
-   """Ejecuta una etapa del pipeline, resolviendo reanudaciones, reutilizando
+    """Ejecuta una etapa del pipeline, resolviendo reanudaciones, reutilizando
       resultados vigentes mediante fingerprints o ejecutándola nuevamente cuando
       sea necesario. Si la etapa tiene un custom_run, delega en esa ejecución
       especial. Los errores no controlados se convierten en un StageOutcome FAILED
       para mantenerlos registrados y detener la etapa de forma segura.
-   """
+    """
     project_dir = Path(project_dir)
     if spec.max_attempt_number is not None and attempt_number > spec.max_attempt_number:
         raise ValueError(
