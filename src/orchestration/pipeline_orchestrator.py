@@ -398,7 +398,6 @@ def _run_evaluation_stage(**kwargs):
 # ---------------------------------------------------------------------------
 # Protocolo transaccional para la etapa 06
 # ---------------------------------------------------------------------------
-# Garantiza que la etapa 06 siga el mismo protocolo transaccional del resto del pipeline.
 
 # Ejecuta la etapa 06 mediante el ciclo PREPARE → EXECUTE → PERSIST → COMMIT.
 # Si la redacción falla, convierte el error en un AgentResult FAILED para
