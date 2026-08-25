@@ -587,7 +587,9 @@ def _run_verification_stage(
 # Registro de etapas
 # ---------------------------------------------------------------------------
 
-
+# Define la ficha de configuración de cada etapa del pipeline, indicando
+# cómo se construye, ejecuta, reanuda y valida, además de sus reglas
+# especiales de reintentos, fingerprints y ejecución personalizada.
 @dataclass(frozen=True)
 class StageSpec:
     key: str
@@ -595,33 +597,21 @@ class StageSpec:
     build_execution: Callable[[Path, int], tuple[Any, Any]]
     runtime_transaction: Callable[..., Any]
     resolve_resume: Callable[..., Any]
-    # None cuando la etapa no expone (todavía) una función pública de
-    # fingerprints con la misma firma que build_thematic_fingerprints/etc.
-    # (caso de 07: solo existe una versión privada, _stage_fingerprints, no
-    # se importa aquí — ver verification_orchestrator_runtime.py). Cuando es
-    # None, run_stage usa el chequeo antiguo (solo COMPLETED, sin comparar
-    # vigencia) en vez del chequeo de vigencia por fingerprints.
+   
     build_fingerprints: Callable[[Any], Any] | None = None
     max_attempt_number: int | None = None
-    # Punto 7 del pedido: APPROVED_PENDING_MANUAL_REVIEW no se trata como
-    # ADVANCE automático salvo que la etapa lo permita explícitamente. Hoy
-    # ninguna etapa lo permite (False en las 6); queda aquí como el punto de
-    # extensión previsto, no como una regla de negocio ya decidida.
+   
     bypass_manual_review: bool = False
-    # Escape hatch: cuando una etapa no encaja en el patrón genérico
-    # build_execution+runtime_transaction+resolve_resume (caso de 07, que
-    # tiene PREPARE/EXECUTE/COMMIT como 3 llamadas separadas con firmas
-    # propias, y semántica de RESUME más rica que {NO_PENDING,COMMITTED,
-    # REEXECUTE}), custom_run reemplaza por completo la lógica de run_stage
-    # para esa etapa. Firma: (*, store, project_dir, spec, attempt_number,
-    # observations, force_rerun) -> StageOutcome.
+   
     custom_run: Callable[..., "StageOutcome"] | None = None
 
 
+#registro central de etapas que conoce el orquestador. 
+#En otras palabras, _stage_registry() le dice al sistema qué etapas existen 
+#y qué funciones debe usar para preparar, ejecutar, reanudar y validar cada una.
+# y las ejecuciones especiales utilizadas por las etapas 07 y 08.
 def _stage_registry() -> list[StageSpec]:
-    # Los imports quedan diferidos a la primera llamada para no forzar
-    # dependencias pesadas (langchain, chromadb) sólo por importar este
-    # módulo o inspeccionar el registro.
+   
     from src.runtime.extraction_protocol import (
         build_agent_input_fingerprints,
         execute_extraction_runtime_transaction,
@@ -648,13 +638,13 @@ def _stage_registry() -> list[StageSpec]:
 
     return [
         StageSpec(
-            key="03_agente_extraccion_kb",
-            label="02 · Extracción de información científica",
-            build_execution=_real_extraction_execution,
-            runtime_transaction=execute_extraction_runtime_transaction,
-            resolve_resume=resolve_extraction_resume,
-            build_fingerprints=build_agent_input_fingerprints,
-            max_attempt_number=2,
+            key="03_agente_extraccion_kb", #qué etapa es
+            label="02 · Extracción de información científica", #cómo mostrarla
+            build_execution=_real_extraction_execution, #cómo prepararla
+            runtime_transaction=execute_extraction_runtime_transaction, #cómo ejecutarla
+            resolve_resume=resolve_extraction_resume, #cómo reanudarla
+            build_fingerprints=build_agent_input_fingerprints, #cómo comprobar si su resultado sigue vigente
+            max_attempt_number=2, #permite hasta 2 intentos.
         ),
         StageSpec(
             key="03B_extraccion_cuantitativa_kb",
@@ -710,10 +700,7 @@ def _stage_registry() -> list[StageSpec]:
     ]
 
 
-# Etapas con StageSpec ejecutable hoy. 08_evaluacion_experimental ya tiene
-# StageSpec real (a diferencia de rondas anteriores) — nombre
-# "experimental" conservado: la equivalencia de configuración de 08 no
-# tuvo la misma ronda de verificación campo-por-campo que sí tuvo 07.
+#Define el orden canónico de ejecución de las etapas 03 a 08 del pipeline.. 
 STAGE_ORDER: tuple[str, ...] = (
     "03_agente_extraccion_kb",
     "03B_extraccion_cuantitativa_kb",
@@ -731,23 +718,24 @@ STAGE_ORDER: tuple[str, ...] = (
 
 
 @dataclass(frozen=True)
+# Resume el resultado de una etapa y la transición validada que el
+# orquestador debe aplicar después de su ejecución.
 class StageOutcome:
-    key: str
+    key: str #Identificador interno de la etapa
     label: str
-    # SKIPPED_FRESH | COMMITTED (via resume) | COMMITTED | FAILED
-    status: str
-    execution_status: str | None
-    quality_status: str | None
-    warnings: tuple[str, ...]
-    error: Mapping[str, Any] | None
-    attempt_number: int
-    # Transición ya validada por decision_engine.validate_transition:
-    # ADVANCE | RETRY | RETURN | HALT_STAGE | STOP_PIPELINE
-    next_action: str
+    status: str #Estado operativo de la ejecución SKIPPED_FRESH | COMMITTED (via resume) | COMMITTED | FAILED
+    execution_status: str | None #Indica si la ejecución técnica terminó correctamente o falló.
+    quality_status: str | None #Indica el resultado de calidad científica de la etapa, que es distinto del estado técnico.
+    warnings: tuple[str, ...] #Lista de advertencias generadas durante la ejecución.
+    error: Mapping[str, Any] | None #Información del error, si ocurrió alguno.
+    attempt_number: int #intentos
+    next_action: str     # ADVANCE | RETRY | RETURN | HALT_STAGE | STOP_PIPELINE
     target_stage: str | None
     reason_code: str
 
 
+# Valida la transición solicitada por una etapa considerando su calidad,
+# número de intentos y reglas del pipeline antes de aplicarla.
 def _validated_transition_for(
     spec: StageSpec,
     *,
@@ -766,6 +754,8 @@ def _validated_transition_for(
     )
 
 
+# Resume el resultado del agente y determina, después de validar su
+# solicitud, qué acción debe seguir el orquestador en el pipeline.
 def _outcome_from_result(
     spec: StageSpec, result: AgentResult, status: str, *, attempts_used: int
 ) -> StageOutcome:
@@ -790,6 +780,10 @@ def _outcome_from_result(
     )
 
 
+# Recupera el resultado de una etapa ya completada y todavía vigente,
+# reutiliza su transición anterior y construye el StageOutcome necesario
+# para que el orquestador continúe sin ejecutar nuevamente la etapa.
+#(usado para SKIPPED_FRESH)
 def _outcome_from_committed_stage(spec: StageSpec, committed, *, status: str) -> StageOutcome:
     """Construye un StageOutcome a partir de un StageState ya comprometido
     (usado para SKIPPED_FRESH), reutilizando su ``requested_transition``
@@ -821,6 +815,9 @@ def _outcome_from_committed_stage(spec: StageSpec, committed, *, status: str) ->
     )
 
 
+# Controla la ejecución de una etapa individual, decidiendo si debe
+# ejecutarse, reanudarse, reutilizarse o usar una ejecución especial,
+# respetando además los límites de intentos definidos para cada etapa.
 def run_stage(
     *,
     store: StateStore,
@@ -830,38 +827,21 @@ def run_stage(
     observations: Mapping[str, Any] | None = None,
     force_rerun: bool = False,
 ) -> StageOutcome:
-    """Ejecuta (o resuelve/salta) una única etapa y devuelve su resultado.
-
-    Si ``spec.custom_run`` está definido (caso de 07), delega por completo en
-    él y el resto de esta función no se ejecuta — ver el comentario en el
-    campo ``custom_run`` de ``StageSpec`` para el porqué.
-
-    Para las demás etapas, orden de decisiones:
-    1. Si hay una ``pending_execution`` de esta etapa (interrupción previa),
-       se resuelve primero (COMMIT del resultado ya persistido, o liberación
-       para reejecutar) — igual que antes.
-    2. Si la etapa ya quedó COMPLETED, y ``spec.build_fingerprints`` existe,
-       se reconstruye su AgentInput actual y se comparan sus fingerprints
-       contra los comprometidos: si coinciden, se salta (SKIPPED_FRESH); si
-       no, se considera obsoleta y se reejecuta aunque no se haya pedido
-       force_rerun explícitamente. Si ``spec.build_fingerprints`` es None
-       (ninguna etapa hoy), se usa el chequeo antiguo (solo COMPLETED).
-    3. En cualquier otro caso, se ejecuta la transacción real de la etapa.
-
-    Cualquier excepción no capturada por la propia etapa (solo puede ocurrir
-    hoy en 07, que no envuelve fallos de preparación en un AgentResult — ver
-    ``_run_verification_stage``) se convierte aquí en un StageOutcome
-    ``status="FAILED"``/``next_action="HALT_STAGE"`` para que run_pipeline
-    nunca termine con una excepción sin registrar, en vez de dejarla
-    propagar sin control.
-    """
-
+   """Ejecuta una etapa del pipeline, resolviendo reanudaciones, reutilizando
+      resultados vigentes mediante fingerprints o ejecutándola nuevamente cuando
+      sea necesario. Si la etapa tiene un custom_run, delega en esa ejecución
+      especial. Los errores no controlados se convierten en un StageOutcome FAILED
+      para mantenerlos registrados y detener la etapa de forma segura.
+   """
     project_dir = Path(project_dir)
     if spec.max_attempt_number is not None and attempt_number > spec.max_attempt_number:
         raise ValueError(
             f"{spec.key} admite como máximo attempt_number={spec.max_attempt_number}."
         )
 
+# Envuelve toda la ejecución de la etapa en una red de seguridad.
+# Si ocurre un error no controlado, lo convierte en un StageOutcome
+# FAILED y solicita HALT_STAGE en lugar de dejar caer el pipeline.
     try:
         if spec.custom_run is not None:
             return spec.custom_run(
@@ -878,6 +858,9 @@ def run_stage(
 
         state = store.load()
 
+         # Si existe una ejecución pendiente de esta misma etapa, intenta reanudarla.
+         # Si el resultado ya estaba comprometido, lo reutiliza; si debe reejecutarse,
+         # libera el estado pendiente y continúa con la lógica normal de ejecución.
         if (
             state.pending_execution is not None
             and state.pending_execution.target_stage == spec.key
@@ -894,7 +877,11 @@ def run_stage(
                 )
             # REEXECUTE o NO_PENDING: el pending quedó liberado; se sigue abajo.
             state = store.load()
-
+      
+        # Si la etapa ya fue completada, compara sus fingerprints para decidir
+         # si el resultado sigue vigente y puede reutilizarse como SKIPPED_FRESH.
+         # Si quedó obsoleto, vuelve a ejecutarla; después guarda el resultado y
+         # convierte cualquier error no controlado en un StageOutcome FAILED.
         committed = state.stages.get(spec.key)
         if (
             committed is not None
@@ -937,7 +924,7 @@ def run_stage(
         return _outcome_from_result(
             spec, transaction.agent_result, status, attempts_used=attempts_used
         )
-    except Exception as exc:  # noqa: BLE001 - red de seguridad genérica, ver docstring
+    except Exception as exc:  
         return StageOutcome(
             key=spec.key,
             label=spec.label,
@@ -953,6 +940,8 @@ def run_stage(
         )
 
 
+# Resuelve una ejecución pendiente de otra etapa antes de continuar
+# con la etapa actual, evitando que el pipeline quede bloqueado.
 def _reconcile_pending_execution_for_other_stage(
     *,
     store,
@@ -962,31 +951,11 @@ def _reconcile_pending_execution_for_other_stage(
     attempt_numbers: Mapping[str, int],
     observations: Mapping[str, Any] | None,
 ) -> tuple[list["StageOutcome"], bool]:
-    """Si ``state.pending_execution`` existe y apunta a una etapa DISTINTA
-    de ``current_stage``, la reconcilia vía el protocolo OFICIAL de esa
-    otra etapa (``run_stage`` sobre su propio ``StageSpec``) antes de que
-    se intente preparar ``current_stage``.
-
-    Motivo: ``StateStore.prepare_execution`` mantiene un único slot GLOBAL
-    de ``pending_execution`` (no uno por etapa) -- una ejecución
-    interrumpida de OTRA etapa (ej. 07 crasheando antes de comprometer)
-    deja ese slot ocupado y bloquea la preparación de CUALQUIER otra
-    etapa, incluida la que el pipeline está intentando ahora, con
-    ``RuntimeError("a pending execution already exists")``. Esta función
-    nunca lee ni escribe ``pending_execution`` directamente -- delega
-    por completo en ``run_stage()`` para la etapa a la que realmente
-    pertenece, que ya sabe resolverla oficialmente (COMMIT del resultado
-    persistido, liberar para reejecutar, o lo que corresponda según su
-    propio protocolo -- para 07 esto enruta a
-    ``_run_verification_stage``/``resume_agent07_execution``).
-
-    Devuelve ``(outcomes_a_agregar, debe_detenerse)``: si
-    ``debe_detenerse`` es ``True``, el llamador no debe intentar preparar
-    ``current_stage`` en esta vuelta (o bien la pending sigue sin
-    resolverse tras el intento oficial, o bien apunta a una etapa sin
-    ``StageSpec`` registrado -- inconsistencia real que se reporta
-    explícitamente, nunca se oculta ni se fuerza)."""
-
+   """Reconcilia una ejecución pendiente de otra etapa antes de continuar con
+      la etapa actual. Usa el protocolo oficial de esa etapa mediante run_stage()
+      para resolverla correctamente y evita que el slot global pending_execution
+      bloquee el pipeline. Devuelve los resultados generados y si debe detenerse.
+   """
     state = store.load()
     pending = state.pending_execution
     if pending is None or pending.target_stage == current_stage:
@@ -1032,16 +1001,17 @@ def _reconcile_pending_execution_for_other_stage(
 
     state = store.load()
     if state.pending_execution is not None:
-        # El protocolo oficial de esa etapa no logró liberar la pending
-        # (ej. sigue EXECUTED_NOT_COMMITTED esperando otra vuelta) -- no
-        # se fuerza nada más. El llamador se detiene aquí en vez de
-        # intentar preparar current_stage, que el store rechazaría de
-        # nuevo con el mismo error.
         return [reconcile_outcome], True
 
     return [reconcile_outcome], False
 
 
+
+# Aplica la transición solicitada por la etapa que acaba de ejecutarse.
+# Según el resultado, puede avanzar a la siguiente etapa, repetir la actual,
+# regresar a una etapa anterior o detener el pipeline. También actualiza los
+# contadores de intentos y controla el ciclo Redactor ↔ Verificador, deteniendo
+# la ejecución si se supera el número máximo de rondas permitido.
 def _apply_stage_transition(
     outcome: "StageOutcome",
     *,
@@ -1052,25 +1022,11 @@ def _apply_stage_transition(
     until: str | None,
     outcomes: list["StageOutcome"],
 ) -> tuple[str | None, bool]:
-    """Interpreta ``outcome.next_action`` con la MISMA semántica que
-    gobierna el bucle principal de ``run_pipeline`` (ADVANCE con
-    resolución de ciclo, RETRY, RETURN con ``apply_return_with_cycle`` y
-    posible agotamiento del ciclo, o HALT_STAGE/STOP_PIPELINE) --
-    factorizada para poder aplicarse tanto a la etapa que el bucle está
-    procesando en su vuelta normal como a una etapa reconciliada fuera de
-    orden (ver ``_reconcile_pending_execution_for_other_stage``): antes
-    de esta función, la transición de una etapa reconciliada (ej. 07,
-    resuelta porque tenía una ``pending_execution`` vieja) se ignoraba
-    por completo -- el bucle seguía su recorrido normal desde
-    ``current_stage`` sin importar si la reconciliación había producido
-    HALT_STAGE, RETURN o ADVANCE, lo que permitía llegar a intentar una
-    etapa posterior (06) que ya no correspondía tocar.
-
-    Devuelve ``(nuevo_current_stage_o_None, debe_detenerse)`` -- si
-    ``debe_detenerse`` es ``True``, el llamador debe terminar el bucle
-    (pipeline completo, HALT_STAGE/STOP_PIPELINE, o ciclo agotado -- en
-    este último caso ya se agregó el ``StageOutcome`` de
-    ``CYCLE_EXHAUSTED`` a ``outcomes`` antes de devolver)."""
+   """Interpreta la acción indicada por una etapa y decide cuál debe ser
+      la siguiente etapa del pipeline o si la ejecución debe detenerse.
+      Aplica la misma lógica para ADVANCE, RETRY, RETURN y HALT/STOP,
+      incluso cuando la etapa fue reconciliada fuera del flujo normal.
+   """
 
     if until is not None and stage_key == until:
         return None, True
@@ -1127,31 +1083,19 @@ from src.orchestration.decision_log_frontier import (
 )
 
 
+# Comprueba si el pipeline ya terminó previamente con HALT_STAGE o
+# STOP_PIPELINE. Si existe ese estado terminal, recupera su resultado
+# histórico y evita ejecutar nuevamente las etapas, salvo que se solicite
+# explícitamente un punto de inicio o una reejecución forzada.
 def _check_already_terminal_state(
     *, store, registry: Mapping[str, "StageSpec"], start_stage: str | None, force_rerun: bool
 ) -> "StageOutcome | None":
-    """Si la decisión AUTORITATIVA del ``decision_log`` (ver
-    ``_reconstruct_authoritative_frontier`` -- ni la última entrada
-    cronológica ni asumir un único tramo desde el principio) pidió
-    explícitamente ``HALT_STAGE`` o ``STOP_PIPELINE``, el pipeline ya
-    está en un estado TERMINAL -- un restart sin ``start_stage``
-    explícito ni ``--force-rerun`` no debe recorrer las etapas de nuevo
-    asumiendo que hay trabajo pendiente. Devuelve el ``StageOutcome``
-    terminal a reportar tal cual (sin tocar ningún estado), o ``None``
-    si no aplica.
-
-    El ``StageOutcome`` se construye SIEMPRE a partir del propio
-    ``frontier_entry.result`` (el ``AgentResult`` persistido en esa
-    entrada exacta del log, vía ``AgentResult.from_dict`` +
-    ``_outcome_from_result`` -- la misma función que ya usa el resto del
-    módulo para construir un ``StageOutcome`` desde un ``AgentResult``
-    real) -- nunca desde ``state.stages[stage]`` (el estado COMPROMETIDO
-    VIGENTE de esa etapa), que puede corresponder a una ejecución
-    POSTERIOR y distinta de la entrada histórica que este chequeo
-    determinó como terminal. Mezclar ambas fuentes es exactamente lo
-    que producía ``ALREADY_TERMINAL`` con un ``next_action=ADVANCE`` --
-    una contradicción de contrato que nunca debe poder ocurrir: se
-    afirma explícitamente como invariante antes de devolver."""
+   """Detecta si el pipeline ya quedó detenido de forma terminal según la
+      decisión autoritativa registrada en el decision_log. Si la última decisión
+      válida fue HALT_STAGE o STOP_PIPELINE, reconstruye ese resultado terminal
+      desde el AgentResult histórico correspondiente y evita reiniciar etapas
+      innecesariamente o mezclarlo con estados posteriores inconsistentes.
+   """
 
     if start_stage is not None or force_rerun:
         return None
@@ -1174,16 +1118,11 @@ def _check_already_terminal_state(
         registry[frontier_entry.stage], frontier_result, "ALREADY_TERMINAL", attempts_used=frontier_entry.attempt
     )
 
-    # Invariante obligatoria: ALREADY_TERMINAL nunca puede coexistir con
-    # una transición no terminal. Si por cualquier motivo no se cumple
-    # (no debería, dado el chequeo de frontier_transition.action arriba,
-    # pero se verifica explícitamente en vez de confiar en eso
-    # implícitamente), no se afirma un estado terminal que el propio
-    # outcome contradice -- se deja que el flujo normal decida.
     if outcome.next_action not in ("HALT_STAGE", "STOP_PIPELINE"):
         return None
 
     return outcome
+
 
 
 def run_pipeline(
@@ -1196,27 +1135,11 @@ def run_pipeline(
     max_iterations: int = 50,
     observations: Mapping[str, Any] | None = None,
 ) -> list[StageOutcome]:
-    """Corre el pipeline interpretando las transiciones solicitadas por cada etapa.
-
-    A diferencia de la versión anterior (un ``for`` fijo sobre ``STAGE_ORDER``
-    que se detenía en el primer FAILED), esto ahora es un bucle guiado por
-    ``RequestedTransition`` validado con ``decision_engine.validate_transition``:
-
-    - ``ADVANCE`` → sigue a la etapa objetivo (por defecto la siguiente).
-    - ``RETRY`` → reintenta la misma etapa (respetando el límite de intentos).
-    - ``RETURN`` → invalida la etapa objetivo y todas las posteriores
-      (``decision_engine.invalidate_from``) y continúa desde ahí.
-    - ``HALT_STAGE`` / ``STOP_PIPELINE`` → detiene el bucle.
-
-    ``until``: si se da, se detiene apenas la etapa con esa clave produce un
-    resultado (antes de avanzar a la siguiente), incluso si el resultado
-    pedía ADVANCE.
-
-    ``force_rerun`` sólo se aplica a ``start_stage`` (o a la primera etapa si
-    no se indica); las etapas alcanzadas después por ADVANCE/RETRY/RETURN se
-    evalúan normalmente (con su propio chequeo de fingerprints).
-    """
-
+    """Ejecuta el pipeline siguiendo las transiciones solicitadas por cada etapa:
+       ADVANCE para avanzar, RETRY para repetir, RETURN para volver e invalidar
+       etapas posteriores, y HALT_STAGE/STOP_PIPELINE para detenerse. También permite
+       parar en una etapa específica con `until` y aplicar `force_rerun` solo al inicio.
+      """
     attempt_numbers = dict(attempt_numbers or {})
     store = ensure_pipeline_state(project_dir)
     registry = {spec.key: spec for spec in _stage_registry()}
@@ -1265,15 +1188,7 @@ def run_pipeline(
             outcomes.append(reconcile_outcome)
             _print_outcome(reconcile_outcome)
             if must_stop:
-                # Inconsistencia real (etapa de la pending sin StageSpec
-                # registrado) o la pending sigue sin resolverse tras el
-                # intento oficial -- no hay transición válida que
-                # despachar; se detiene aquí, igual que antes.
                 break
-            # La transición REAL de la etapa reconciliada (HALT_STAGE,
-            # RETURN o ADVANCE) gobierna el flujo principal a partir de
-            # aquí -- nunca se ignora para seguir el recorrido normal
-            # desde current_stage.
             reconciled_stage_key = reconcile_outcome.key
             reconciled_attempt_number = attempt_numbers.get(reconciled_stage_key, 1)
             new_stage, should_stop = _apply_stage_transition(
@@ -1313,6 +1228,7 @@ def run_pipeline(
         )
 
     return outcomes
+
 
 
 def _print_outcome(outcome: StageOutcome) -> None:
