@@ -1128,13 +1128,13 @@ def _check_already_terminal_state(
 def run_pipeline(
     project_dir: str | Path,
     *,
-    start_stage: str | None = None,
-    until: str | None = None,
-    attempt_numbers: Mapping[str, int] | None = None,
-    force_rerun: bool = False,
-    max_iterations: int = 50,
+    start_stage: str | None = None, #desde qué etapa empezar
+    until: str | None = None, #Permite detener el pipeline después de una etapa específica.
+    attempt_numbers: Mapping[str, int] | None = None, #indicar el número de intento actual de cada etapa.
+    force_rerun: bool = False, #forzar la reejecución de la etapa inicial aunque ya tenga resultado válido.
+    max_iterations: int = 50, #límite de seguridad para evitar ciclos infinitos.
     observations: Mapping[str, Any] | None = None,
-) -> list[StageOutcome]:
+) -> list[StageOutcome]: #lista con los resultados de las etapas procesadas.
     """Ejecuta el pipeline siguiendo las transiciones solicitadas por cada etapa:
        ADVANCE para avanzar, RETRY para repetir, RETURN para volver e invalidar
        etapas posteriores, y HALT_STAGE/STOP_PIPELINE para detenerse. También permite
@@ -1147,18 +1147,21 @@ def run_pipeline(
     if until is not None and until not in STAGE_ORDER:
         raise ValueError(f"Etapa desconocida en 'until': {until}")
 
-    current_stage = start_stage or STAGE_ORDER[0]
+    current_stage = start_stage or STAGE_ORDER[0] #empieza por la primera del pipeline.
     outcomes: list[StageOutcome] = []
     force_rerun_current = force_rerun
 
     terminal_outcome = _check_already_terminal_state(
-        store=store, registry=registry, start_stage=start_stage, force_rerun=force_rerun
+        store=store, registry=registry, start_stage=start_stage, force_rerun=force_rerun #Comprueba si una ejecución anterior ya dejó el pipeline detenido definitivamente.
     )
     if terminal_outcome is not None:
         _print_outcome(terminal_outcome)
         return [terminal_outcome]
-
+   #_______________________________
+   #bucle principal del orquestador
+   #_______________________________
     for _ in range(max_iterations):
+       #se llegó a una etapa no ejecutable ordena detener el pipeline.
         if current_stage not in registry:
             outcomes.append(
                 StageOutcome(
@@ -1177,21 +1180,21 @@ def run_pipeline(
             )
             break
 
-        spec = registry[current_stage]
+        spec = registry[current_stage] #Obtiene la ficha StageSpec de la etapa actual.
 
-        reconcile_outcomes, must_stop = _reconcile_pending_execution_for_other_stage(
+        reconcile_outcomes, must_stop = _reconcile_pending_execution_for_other_stage( #Comprueba si quedó una ejecución pendiente de otra etapa anterior.
             store=store, project_dir=project_dir, registry=registry, current_stage=current_stage,
             attempt_numbers=attempt_numbers, observations=observations,
         )
-        if reconcile_outcomes:
-            reconcile_outcome = reconcile_outcomes[0]
-            outcomes.append(reconcile_outcome)
+        if reconcile_outcomes: #Si efectivamente tuvo que resolver algo pendiente...
+            reconcile_outcome = reconcile_outcomes[0] #obtiene el resultado de esa reconciliación.
+            outcomes.append(reconcile_outcome) #lo guarda
             _print_outcome(reconcile_outcome)
             if must_stop:
                 break
-            reconciled_stage_key = reconcile_outcome.key
-            reconciled_attempt_number = attempt_numbers.get(reconciled_stage_key, 1)
-            new_stage, should_stop = _apply_stage_transition(
+            reconciled_stage_key = reconcile_outcome.key #Identifica qué etapa fue la que se acaba de reconciliar.
+            reconciled_attempt_number = attempt_numbers.get(reconciled_stage_key, 1) #Obtiene su número de intento.
+            new_stage, should_stop = _apply_stage_transition( #Interpreta qué pidió hacer esa etapa: ADVANCE RETRY RETURN HALT_STAGE STOP_PIPELINE  
                 reconcile_outcome, store=store, stage_key=reconciled_stage_key,
                 attempt_number=reconciled_attempt_number, attempt_numbers=attempt_numbers,
                 until=until, outcomes=outcomes,
@@ -1200,21 +1203,22 @@ def run_pipeline(
                 break
             current_stage = new_stage
             continue
-
-        attempt_number = attempt_numbers.get(current_stage, 1)
-        outcome = run_stage(
-            store=store,
-            project_dir=project_dir,
-            spec=spec,
-            attempt_number=attempt_number,
-            observations=observations,
-            force_rerun=force_rerun_current,
+        
+       #Si no había ninguna ejecución pendiente, llega al flujo normal:
+        attempt_number = attempt_numbers.get(current_stage, 1) #Obtiene el intento actual de la etapa.
+        outcome = run_stage( #ejecuta la etapa actual o decide reutilizar/reanudar su resultado.
+            store=store, #estado del pipeline
+            project_dir=project_dir, #ruta del proyecto
+            spec=spec, #StageSpec
+            attempt_number=attempt_number, #número de intento
+            observations=observations, #observaciones
+            force_rerun=force_rerun_current, #force_rerun
         )
         force_rerun_current = False
         outcomes.append(outcome)
         _print_outcome(outcome)
 
-        new_stage, should_stop = _apply_stage_transition(
+        new_stage, should_stop = _apply_stage_transition( #interpreta qué transición pidió la etapa que acaba de ejecutarse. (04 → ADVANCE → 05,07 → RETURN → 06)
             outcome, store=store, stage_key=current_stage, attempt_number=attempt_number,
             attempt_numbers=attempt_numbers, until=until, outcomes=outcomes,
         )
@@ -1230,11 +1234,11 @@ def run_pipeline(
     return outcomes
 
 
-
+#mostrar en pantalla un resumen legible del resultado de una etapa.
 def _print_outcome(outcome: StageOutcome) -> None:
     print(
-        f"[{outcome.status:24s}] {outcome.label:45s} "
-        f"execution={outcome.execution_status} quality={outcome.quality_status} "
+        f"[{outcome.status:24s}] {outcome.label:45s} " #estado #nombre de la etapa
+        f"execution={outcome.execution_status} quality={outcome.quality_status} " #estado técnico (complete) y de calidad (approved)
         f"next={outcome.next_action}->{outcome.target_stage}"
     )
     for warning in outcome.warnings:
@@ -1243,10 +1247,10 @@ def _print_outcome(outcome: StageOutcome) -> None:
         print(f"    error: {outcome.error}")
 
 
+
 # ---------------------------------------------------------------------------
 # CLI para uso directo en Colab: `python -m src.orchestration.pipeline_orchestrator`
 # ---------------------------------------------------------------------------
-
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
