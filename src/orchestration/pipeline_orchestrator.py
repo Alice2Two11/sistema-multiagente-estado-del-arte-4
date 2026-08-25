@@ -1,46 +1,85 @@
-"""Orquestador de las etapas 02-06 usando exclusivamente los componentes de ``src/``.
-
+"""Orquestador de las etapas 03-06 usando exclusivamente los componentes de ``src/``.
 Diseño
 ------
-Cada etapa migrada ya expone dos piezas reutilizables:
+El orquestador coordina las etapas operativas del pipeline implementadas en
+``src/`` y reutiliza, para cada una de ellas, componentes especializados de
+ejecución, validación, persistencia y control de estado.
 
-1. Un constructor ``build_real_<etapa>_execution(project_dir, attempt_number)``
-   (en ``src/adapters/*_runtime.py``) que arma el agente/capability real y su
-   ``AgentInput`` a partir de ``active_experiment.json`` y los artefactos ya
-   generados en el proyecto.
-2. Un protocolo transaccional (en ``src/runtime/*_protocol.py``) que envuelve
-   PREPARE → EXECUTE → persist → COMMIT sobre ``StateStore``, convirtiendo
-   cualquier fallo de preparación (dependencia faltante, credencial ausente,
-   etc.) en un ``AgentResult`` ``FAILED`` comprometido igualmente al estado,
-   en vez de dejar una excepción sin registrar.
+Cada etapa orquestada expone principalmente:
 
-Este módulo declara, para cada etapa, su constructor, su protocolo
-transaccional y su función de fingerprints, y ofrece un bucle
-(``run_pipeline``) que ahora interpreta ``RequestedTransition`` en vez de
-limitarse a recorrer ``STAGE_ORDER`` en orden fijo. La semántica de decisión
-(ADVANCE/RETRY/RETURN/HALT_STAGE/STOP_PIPELINE, vigencia por fingerprints,
-invalidación en cascada) vive en ``decision_engine.py``; este módulo solo la
-conecta con la ejecución real de cada etapa:
+1. Un constructor de ejecución ubicado en ``src/adapters/*_runtime.py`` que
+   prepara el agente o capacidad correspondiente, construye su ``AgentInput``
+   y conecta las dependencias necesarias a partir de la configuración del
+   experimento activo y de los artefactos generados por etapas anteriores.
 
-- reutiliza el ``pipeline_state.json`` canónico del experimento activo;
-- si una etapa ya quedó ``COMPLETED`` y sus fingerprints siguen vigentes, la
-  salta (``SKIPPED_FRESH``); si los datos de entrada cambiaron, la reejecuta
-  aunque no se haya pedido ``force_rerun``;
-- si existe una ejecución PENDING de un run anterior, la resuelve (COMMITTED
-  o REEXECUTE) antes de continuar, igual que hacen los notebooks;
-- sigue la transición que cada etapa solicitó (validada primero: ver
-  ``decision_engine.validate_transition``), no un orden fijo.
+2. Un mecanismo de ejecución transaccional que controla el ciclo
+   PREPARE → EXECUTE → persist → COMMIT sobre ``StateStore``. Esto permite
+   registrar de forma consistente tanto ejecuciones exitosas como fallos,
+   evitando que una excepción deje el estado del pipeline incompleto o sin
+   trazabilidad.
 
-No orquesta notebooks ni depende de ellos: sólo importa símbolos de ``src/``.
+Este módulo mantiene la especificación de las etapas, conecta sus
+constructores con los mecanismos de ejecución y proporciona ``run_pipeline``
+como bucle principal de orquestación. El avance no depende únicamente de
+recorrer una lista fija de etapas, sino de las transiciones solicitadas por
+cada ejecución mediante ``RequestedTransition``.
 
-Etapas 01 (ingesta) y 08 (evaluación) no están incluidas: según
-``LEEME_PRIMERO.md`` su ejecución operativa permanece en el notebook de Drive
-y no exponen un constructor equivalente en ``src/``. La etapa 07
-(verificación) tampoco está incluida todavía: su wiring productivo depende de
-módulos que generan los propios notebooks dentro del proyecto (``config.py``,
-``llm_utils.py``, ``rag_utils.py``, el retriever de Chroma), no de ``src/``;
-añadir un ``StageSpec`` para 07 requiere primero decidir cómo exponer esas
-piezas fuera del notebook.
+La lógica de decisión se encuentra separada en ``decision_engine.py``. Allí
+se validan decisiones como ADVANCE, RETRY, RETURN, HALT_STAGE y STOP_PIPELINE,
+además de la vigencia de resultados mediante fingerprints y la invalidación
+en cascada cuando cambian datos de entrada. El orquestador aplica estas
+decisiones sobre la ejecución real de los agentes y capacidades.
+
+Durante la ejecución:
+
+- utiliza el ``pipeline_state.json`` canónico del experimento activo para
+  conservar el estado global del pipeline;
+- puede reutilizar resultados previamente completados cuando sus fingerprints
+  siguen vigentes, evitando ejecuciones innecesarias;
+- vuelve a ejecutar una etapa cuando sus entradas o dependencias relevantes
+  han cambiado;
+- resuelve ejecuciones pendientes de runs anteriores antes de continuar;
+- valida cada transición solicitada antes de aplicarla;
+- conserva los resultados, errores, artefactos y decisiones necesarios para
+  mantener trazabilidad entre etapas.
+
+El flujo actualmente orquestado comprende:
+
+03  → extracción estructurada de información científica;
+03B → extracción cuantitativa como capacidad especializada;
+04  → análisis temático transversal;
+05  → generación del esquema del estado del arte;
+06  → redacción del borrador;
+07  → verificación científica, trazabilidad y recuperación adicional de
+      evidencia cuando resulta necesaria;
+08  → evaluación del estado del arte generado mediante métricas automáticas
+      y comparación con el Ground Truth.
+
+La etapa 03B se implementa como una capacidad especializada y no como un
+agente autónomo independiente.
+
+La verificación de la etapa 07 integra el Retriever y los mecanismos de
+recuperación adicional de evidencia. Cuando la evidencia inicial de una
+afirmación no resulta suficiente, el subsistema de Agentic Retrieval puede
+decidir nuevas acciones de recuperación, como reformular la consulta o
+ajustar la cantidad de resultados recuperados, antes de entregar la evidencia
+final al agente verificador.
+
+La etapa 08 consume los artefactos generados por el pipeline y realiza la
+evaluación final. El Ground Truth permanece separado de las etapas de
+generación, recuperación y verificación, y se utiliza únicamente durante esta
+fase de evaluación.
+
+Las etapas 00, 01 y 02 no forman parte del bucle interno de
+``pipeline_orchestrator.py``. Se ejecutan previamente mediante notebooks y
+preparan respectivamente la configuración del experimento, la memoria
+documental y el índice vectorial/Retriever RAG necesarios para la ejecución
+posterior.
+
+Por tanto, el orquestador no ejecuta notebooks ni depende de sus celdas como
+unidades de procesamiento. Los notebooks funcionan como puntos de entrada y
+preparación experimental, mientras que la lógica multiagente de las etapas
+03–08 está modularizada en archivos Python dentro de ``src/``.
 """
 
 from __future__ import annotations
@@ -53,6 +92,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+# Importa las estructuras y enumeraciones que estandarizan el resultado
+# de ejecución de los agentes, incluyendo estado técnico, estado de calidad,
+# advertencias, uso de herramientas, información de decisión y transiciones
+# solicitadas entre las distintas etapas del pipeline.
 from src.contracts.agent_result import (
     AgentResult,
     AgentWarning,
@@ -64,6 +107,12 @@ from src.contracts.agent_result import (
     TransitionAction,
     WarningSeverity,
 )
+
+# Importa el motor de decisiones del orquestador y las funciones que
+# controlan el orden de las etapas, los límites de reintentos, la
+# validación de transiciones, la detección de resultados vigentes y
+# la invalidación de etapas cuando cambian sus dependencias. También
+# incluye la lógica para gestionar retornos y ciclos entre etapas.
 from src.orchestration import decision_engine as de
 from src.orchestration.decision_engine import (
     CANONICAL_STAGE_ORDER,
@@ -87,7 +136,6 @@ DRAFT_STAGE_NAME = "06_agente_redactor"
 # Resolución de rutas del experimento activo
 # ---------------------------------------------------------------------------
 
-
 def load_active_experiment(project_dir: str | Path) -> dict[str, Any]:
     root = Path(project_dir).resolve()
     active_path = root / "active_experiment.json"
@@ -98,7 +146,7 @@ def load_active_experiment(project_dir: str | Path) -> dict[str, Any]:
         )
     return json.loads(active_path.read_text(encoding="utf-8"))
 
-
+# Determina la ruta del pipeline_state.json del experimento activo y devuelve también su experiment_id y run_id.
 def resolve_state_path(project_dir: str | Path) -> tuple[Path, str, str]:
     """Devuelve (state_path, experiment_id, run_id) del experimento activo."""
 
@@ -113,6 +161,7 @@ def resolve_state_path(project_dir: str | Path) -> tuple[Path, str, str]:
     return state_path, experiment_id, run_id
 
 
+#Abre el estado persistente del pipeline y, si aún no existe, crea e inicializa un pipeline_state.json nuevo para el experimento activo.
 def ensure_pipeline_state(project_dir: str | Path) -> StateStore:
     """Abre el ``StateStore`` canónico, inicializándolo si es la primera vez."""
 
@@ -134,11 +183,16 @@ def ensure_pipeline_state(project_dir: str | Path) -> StateStore:
     return store
 
 
+
 # ---------------------------------------------------------------------------
 # Constructores reales por etapa (envuelven los `build_real_*` existentes)
 # ---------------------------------------------------------------------------
 
 
+#Construye y prepara la ejecución real del Agente de Extracción: carga configuración y 
+#credenciales, crea el runtime y el AgentInput, y devuelve el ExtractionAgent listo para 
+#ejecutarse junto con su entrada. (arma todo lo necesario para poder ejecutar el Agente 
+# 03 de Extracción.)
 def _real_extraction_execution(project_dir: Path, attempt_number: int):
     from src.adapters.extraction_runtime import (
         build_agent_input,
@@ -162,20 +216,22 @@ def _real_extraction_execution(project_dir: Path, attempt_number: int):
     return ExtractionAgent(runtime.dependencies), agent_input
 
 
+# Prepara la capacidad de extracción cuantitativa 03B y su entrada para 
+# que el orquestador pueda ejecutarla.
 def _real_quantitative_execution(project_dir: Path, attempt_number: int):
     from src.adapters.quantitative_extraction_runtime import (
         build_quantitative_agent_input,
         build_quantitative_capability,
         load_quantitative_configuration,
     )
-
-    # El Agente 03B sólo admite attempt_number=1 en el wiring actual de src/.
     configuration = load_quantitative_configuration(project_dir)
     capability = build_quantitative_capability(configuration)
     agent_input = build_quantitative_agent_input(configuration)
     return capability, agent_input
 
 
+# Prepara el Agente de Análisis Temático y su AgentInput para que
+# el orquestador pueda ejecutar la etapa 04.
 def _real_thematic_execution(project_dir: Path, attempt_number: int):
     from src.adapters.thematic_analysis_runtime import build_real_thematic_execution
 
@@ -185,6 +241,8 @@ def _real_thematic_execution(project_dir: Path, attempt_number: int):
     return agent, agent_input
 
 
+# Prepara el Generador de Esquema y su AgentInput para que
+# el orquestador pueda ejecutar la etapa 05.
 def _real_outline_execution(project_dir: Path, attempt_number: int):
     from src.adapters.outline_generation_runtime import build_real_outline_execution
 
@@ -193,16 +251,15 @@ def _real_outline_execution(project_dir: Path, attempt_number: int):
     )
     return agent, agent_input
 
-
+   
+#Decide si el Agente Redactor 06 debe escribir un borrador inicial o corregir 
+#un borrador anterior después de la verificación 07.
 def _resolve_draft_execution_mode(project_dir: Path, store) -> dict[str, Any] | None:
-    """Detecta si 06 debe ejecutarse en modo REVISION: hay un ciclo
-    ``writer_verifier`` ACTIVE con al menos una ronda usada. Si es así,
-    lee la ÚLTIMA ronda persistida por 07 (``writer_verifier_cycle/
-    round_NN/writer_revision_request.json``) y el borrador comprometido
-    más reciente de 06, y devuelve los ``policy_overrides`` para
-    construir el ``AgentInput`` de revisión. Devuelve ``None`` si debe
-    ejecutarse en modo INITIAL_DRAFT (sin ciclo activo, o ciclo resuelto)."""
-
+  
+   # Comprueba el estado actual del ciclo entre el Redactor y el Verificador.
+   # Si no existe un ciclo activo o todavía no se ha usado ninguna ronda,
+   # la función concluye que 06 debe trabajar en modo INITIAL_DRAFT y
+   # devuelve None sin buscar información adicional de revisión.
     state = store.load()
     cycle = state.cycles.get("writer_verifier")
     if cycle is None or cycle.status != "ACTIVE" or cycle.rounds_used == 0:
@@ -217,6 +274,10 @@ def _resolve_draft_execution_mode(project_dir: Path, store) -> dict[str, Any] | 
         round_is_persisted,
     )
 
+   # Recupera la información del experimento activo y localiza las rondas
+   # de revisión que fueron persistidas por el ciclo 06 ↔ 07. Selecciona
+   # la ronda más reciente y verifica que exista correctamente en disco
+   # antes de intentar reconstruir una ejecución de revisión.
     active_experiment = _json.loads((project_dir / "active_experiment.json").read_text(encoding="utf-8"))
     experiment_id = active_experiment["active_experiment_id"]
 
@@ -239,19 +300,9 @@ def _resolve_draft_execution_mode(project_dir: Path, store) -> dict[str, Any] | 
             f"DRAFT_REVISION_ROUND_UNEXPECTED_STATUS: round_{round_number:02d} está en "
             f"{status['status']!r}, se esperaba 'AWAITING_REVISION' o 'REVISION_COMPLETED'."
         )
-    # 'REVISION_COMPLETED' significa que 06 YA completó esta ronda en una
-    # ejecución previa -- no hay nada nuevo que escribir. Esta función NO
-    # decide si 06 se reinvoca: solo reconstruye el MISMO AgentInput con el
-    # que se comprometió esa revisión, para que su fingerprint coincida con
-    # el ya comprometido y run_stage() lo reconozca como SKIPPED_FRESH sin
-    # tocar la ronda. writer_revision_request.json y el borrador previo son
-    # los MISMOS archivos persistidos en ambos estados (AWAITING_REVISION y
-    # REVISION_COMPLETED) -- solo cambia el campo de estado de la ronda, que
-    # no forma parte de este AgentInput. Si, pese a la coincidencia de
-    # fingerprint, algo más forzara una reinvocación real de 06 sobre esta
-    # misma ronda, complete_round_revision() ya rechaza explícitamente un
-    # segundo intento de completarla (ver su docstring) -- esa red de
-    # seguridad no se toca aquí.
+   # Si la ronda ya está REVISION_COMPLETED, se reconstruye el mismo
+   # AgentInput para que run_stage() la detecte como SKIPPED_FRESH
+   # y evite ejecutar nuevamente una revisión ya completada.
 
     writer_revision_request = read_round_artifact(
         project_dir=project_dir, experiment_id=experiment_id, round_number=round_number,
@@ -273,6 +324,10 @@ def _resolve_draft_execution_mode(project_dir: Path, store) -> dict[str, Any] | 
             f"{writer_revision_request.get('round_number')!r}, se esperaba {round_number}."
         )
 
+   # Carga el último borrador comprometido por el Redactor y comprueba,
+   # mediante su fingerprint, que sea el mismo borrador que fue evaluado
+   # por el Verificador. Si todo coincide, devuelve los datos necesarios
+   # para construir la nueva ejecución de 06 en modo REVISION.
     experiment_dir = project_dir / experiment_id
     draft_json_path = experiment_dir / "05_outputs" / "05_draft" / "state_of_art_draft.json"
     if not draft_json_path.is_file():
@@ -287,7 +342,6 @@ def _resolve_draft_execution_mode(project_dir: Path, store) -> dict[str, Any] | 
             "DRAFT_REVISION_FINGERPRINT_MISMATCH: el borrador en disco no coincide "
             "con source_draft_fingerprint del writer_revision_request."
         )
-
     return {
         "mode": "REVISION",
         "writer_revision_request": writer_revision_request,
@@ -298,6 +352,8 @@ def _resolve_draft_execution_mode(project_dir: Path, store) -> dict[str, Any] | 
     }
 
 
+# Prepara el Agente Redactor 06, determina si trabaja en modo inicial
+# o revisión y devuelve el agente con su AgentInput listo para ejecutar.
 def _real_draft_execution(project_dir: Path, attempt_number: int):
     from src.adapters.draft_writing_runtime import build_real_draft_execution
 
@@ -311,6 +367,8 @@ def _real_draft_execution(project_dir: Path, attempt_number: int):
     return agent, agent_input
 
 
+# Prepara la etapa 07 de verificación y devuelve su ejecución
+# lista para ser utilizada por el orquestador.
 def _experimental_verification_execution(project_dir: Path, attempt_number: int):
     from src.adapters.verification_orchestrator_runtime import (
         build_experimental_verification_execution,
@@ -319,12 +377,16 @@ def _experimental_verification_execution(project_dir: Path, attempt_number: int)
     return build_experimental_verification_execution(project_dir, attempt_number)
 
 
+# Prepara la etapa 08 de evaluación y devuelve su ejecución
+# lista para ser utilizada por el orquestador.
 def _experimental_evaluation_execution(project_dir: Path, attempt_number: int):
     from src.adapters.evaluation_stagespec_wiring import build_execution_for_stagespec
 
     return build_execution_for_stagespec(project_dir, attempt_number)
 
 
+# Ejecuta la etapa 08 utilizando la implementación real del
+# runtime de evaluación y devuelve su resultado al orquestador.
 def _run_evaluation_stage(**kwargs):
     from src.adapters.evaluation_orchestrator_runtime import (
         _run_evaluation_stage as _real_run_evaluation_stage,
@@ -336,15 +398,11 @@ def _run_evaluation_stage(**kwargs):
 # ---------------------------------------------------------------------------
 # Protocolo transaccional para la etapa 06
 # ---------------------------------------------------------------------------
-#
-# A diferencia de 03B/04/05, `src/runtime/draft_writing_protocol.py` sólo
-# expone `execute_draft_transaction`, que requiere el agente y el
-# `AgentInput` ya construidos, sin capturar fallos de preparación. Para
-# mantener el mismo comportamiento que las demás etapas (una etapa que no
-# pudo prepararse queda comprometida como FAILED en vez de perderse como una
-# excepción no registrada), replicamos aquí el mismo patrón que ya usan
-# `execute_thematic_runtime_transaction` / `execute_outline_runtime_transaction`.
+# Garantiza que la etapa 06 siga el mismo protocolo transaccional del resto del pipeline.
 
+# Ejecuta la etapa 06 mediante el ciclo PREPARE → EXECUTE → PERSIST → COMMIT.
+# Si la redacción falla, convierte el error en un AgentResult FAILED para
+# mantenerlo registrado en el estado del pipeline en lugar de perder la excepción.
 
 def _draft_runtime_transaction(
     *,
