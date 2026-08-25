@@ -1,25 +1,33 @@
-"""Dependency-injected coordinator for notebook-03 scientific extraction.
+"""
+Coordinador del Agente 03 de extracción científica.
 
-The agent coordinates the eight approved internal modules. It does not connect
-to external model or vector services, access transactional persistence, or decide graph transitions. ``requested_transition`` is only a request returned
-inside ``AgentResult``.
+Organiza la ejecución de los módulos internos encargados de extraer y
+estructurar información científica de los papers. Sus dependencias se
+inyectan desde el runtime, por lo que el agente no crea directamente
+conexiones con el LLM, Chroma ni la persistencia transaccional.
+
+El agente produce un AgentResult con los resultados de la extracción y
+puede solicitar una transición mediante requested_transition, pero la
+decisión final sobre el flujo del pipeline corresponde al orquestador.
 """
 
 from __future__ import annotations
-
 from dataclasses import dataclass, field
 from datetime import datetime
 import json
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
-
 import pandas as pd
 
+# Importa las estructuras que estandarizan la entrada del agente,
+# las referencias a artefactos y el modo en que debe ejecutarse.
 from src.contracts.agent_input import (
     AgentInput,
     ArtifactReference,
     ExecutionMode,
 )
+# Importa las estructuras que estandarizan el resultado del agente,
+# incluyendo estados, advertencias, decisiones, transiciones y uso de herramientas.
 from src.contracts.agent_result import (
     AgentResult,
     AgentWarning,
@@ -31,16 +39,22 @@ from src.contracts.agent_result import (
     TransitionAction,
     WarningSeverity,
 )
+# Importa funciones para guardar archivos de forma segura,
+# evitando que queden incompletos si ocurre un error durante la escritura.
 from src.io.atomic_write import (
     atomic_write_jsonl,
     atomic_write_text,
 )
 from src.state.fingerprints import sha256_file
+# Importa las funciones que realizan la extracción inicial de fichas
+# científicas y reparan aquellas que quedaron incompletas o inválidas.
 from src.tools.extraction.card_extraction import (
     generate_repaired_card_for_source,
     run_bad_card_repair,
     run_initial_extraction,
 )
+# Importa las reglas y funciones usadas para validar las fichas científicas,
+# detectar fichas problemáticas y construir sus resúmenes e indicadores de calidad.
 from src.tools.extraction.card_validation import (
     CARD_REQUIRED_FIELDS,
     QUALITY_COLUMNS,
@@ -49,21 +63,31 @@ from src.tools.extraction.card_validation import (
     build_summary_row,
     is_bad_card,
 )
+# Importa la función que revisa que los chunks estén bien formados
+# y tengan la información necesaria antes de usarlos en la extracción.
 from src.tools.extraction.chunk_validation import (
     validate_chunks_dataframe,
 )
+# Importa la función que construye y ejecuta la rama encargada
+# de generar la base de conocimiento estructurada de la extracción.
 from src.tools.extraction.knowledge_base import (
     execute_knowledge_base_branch,
 )
+# Importa las funciones que clasifican la relevancia de las fichas
+# científicas y determinan cuándo deben volver a evaluarse.
 from src.tools.extraction.relevance_classification import (
     classify_card_relevance,
     determine_relevance_reclassification,
     run_relevance_classification,
 )
+# Importa las funciones que recuperan los chunks relevantes de cada paper
+# y construyen con ellos el contexto que utilizará el agente de extracción.
 from src.tools.extraction.retrieval import (
     build_context_from_chunks,
     retrieve_chunks_for_paper,
 )
+# Importa funciones para guardar, revisar y controlar los archivos generados
+# por la etapa de extracción, incluyendo respaldos, manifiestos y reconstrucción.
 from src.tools.extraction.stage_artifacts import (
     FINAL_OUTPUT_KEYS,
     TRACKED_STAGE_OUTPUT_KEYS,
@@ -82,9 +106,13 @@ from src.tools.extraction.stage_artifacts import (
     save_json_file,
     stable_hash_dict,
 )
+# Importa la función que revisa y corrige títulos incorrectos
+# o faltantes en las fichas científicas extraídas.
 from src.tools.extraction.title_repair import (
     run_title_repair,
 )
+# Importa funciones que revisan qué información importante falta en cada ficha
+# y construyen un plan para corregir o completar únicamente esos campos.
 from src.tools.extraction.revision_strategy import (
     REVISION_PLAN_COLUMNS,
     build_revision_plan,
@@ -92,11 +120,15 @@ from src.tools.extraction.revision_strategy import (
     plan_by_source,
     missing_critical_fields,
 )
+# Importa funciones que identifican y excluyen papers de revisión
+# que no deben formar parte de la extracción científica principal.
 from src.tools.extraction.review_exclusion import (
     EXCLUSION_AUDIT_COLUMNS,
     apply_review_exclusion_policy,
     is_review_excluded,
 )
+# Importa funciones que determinan qué papers pueden formar parte del corpus,
+# cuáles deben excluirse y cuáles deben quedar en cuarentena para revisión.
 from src.tools.extraction.corpus_eligibility import (
     QUARANTINE_AUDIT_COLUMNS,
     apply_corpus_eligibility_policy,
@@ -113,6 +145,8 @@ _REQUIRED_DEPENDENCIES = (
     "chroma_manifest",
 )
 
+# Define las rutas de archivos y carpetas que deben existir
+# para que la etapa de extracción pueda ejecutarse correctamente.
 _REQUIRED_PATH_KEYS = (
     "OUTPUTS_DIR",
     "DIR_EXTRACTION",
@@ -131,6 +165,8 @@ _REQUIRED_PATH_KEYS = (
     "KB_JSONL_PATH",
 )
 
+# Define los datos de configuración que se comparan entre ejecuciones
+# para detectar si hubo cambios que obliguen a rehacer la extracción.
 _REQUIRED_SIGNATURE_KEYS = (
     "experiment_dir",
     "chroma_collection_name",
@@ -150,6 +186,8 @@ _REQUIRED_SIGNATURE_KEYS = (
     "rag_clean_validation_version",
 )
 
+# Define los parámetros que controlan cómo se recuperan los chunks
+# y cuánto contexto puede utilizarse durante la extracción y reparación.
 _REQUIRED_RETRIEVAL_KEYS = (
     "queries",
     "profile",
@@ -160,12 +198,12 @@ _REQUIRED_RETRIEVAL_KEYS = (
     "repair_max_context_chars",
 )
 
-
 class _DefaultMessage:
     def __init__(self, content: Any):
         self.content = content
 
-
+# Guarda archivos de forma segura, evitando que queden incompletos
+# si ocurre un error durante la escritura.
 class AtomicRawWriter:
     """Writer adapter expected by ``run_bad_card_repair``."""
 
@@ -183,6 +221,8 @@ class AtomicRawWriter:
         )
 
 
+# Lee un archivo JSONL línea por línea, convierte cada línea JSON
+# en un objeto de Python y devuelve todos los registros en una lista.
 def _load_jsonl(path: str | Path) -> list[Any]:
     source = Path(path)
     records = []
@@ -222,10 +262,11 @@ def _default_now() -> str:
     return datetime.now().isoformat()
 
 
+# Define las dependencias que necesita el Agente 03 para funcionar,
+# incluyendo LLMs, prompts, lectura/escritura de archivos, validaciones,
+# reparación de fichas, clasificación de relevancia y construcción de la KB.
 @dataclass(slots=True)
 class ExtractionAgentDependencies:
-    """Runtime dependencies; no real service is constructed by the agent."""
-
     main_llm: Any = None
     repair_llm: Any = None
     extraction_prompt_builder: Callable[..., str] | None = None
@@ -271,6 +312,8 @@ class ExtractionAgent:
     ) -> AgentResult:
         started_at = self.dependencies.now_factory()
         warnings: list[AgentWarning] = []
+        # Inicializa las métricas técnicas de la ejecución,
+        # como reutilización, reconstrucción, respaldo y número de artefactos.
         metrics: dict[str, Any] = {
             "technical": {
                 "reused_outputs": False,
@@ -278,6 +321,8 @@ class ExtractionAgent:
                 "backup_created": False,
                 "artifact_count": 0,
             },
+        # Inicializa las métricas científicas de la extracción,
+        # incluyendo fichas, KB, errores, reparaciones y llamadas al LLM.
             "scientific": {
                 "num_cards": 0,
                 "num_kb_rows": 0,
@@ -300,6 +345,9 @@ class ExtractionAgent:
 
             policy = dict(agent_input.policy)
             paths = self._resolve_paths(policy)
+            
+            # Valida la entrada del Agente 03 y comprueba que las políticas
+            # de firma y recuperación contengan todos los parámetros requeridos.
             signature_policy = self._require_mapping(
                 policy,
                 "signature",
@@ -319,6 +367,8 @@ class ExtractionAgent:
                 "policy.retrieval",
             )
 
+            # Obtiene las referencias a los chunks limpios y al manifiesto de Chroma,
+            # y valida que ambas dependencias estén disponibles y sean correctas.
             chunks_reference = agent_input.dependencies[
                 "chunks_clean"
             ]
@@ -334,6 +384,9 @@ class ExtractionAgent:
                 chroma_reference,
             )
 
+            # Obtiene los recursos disponibles en tiempo de ejecución y carga los
+            # chunks limpios desde memoria o, si no están disponibles, desde el archivo.
+            # Luego verifica que el resultado sea un DataFrame válido.
             runtime_resources = dict(
                 agent_input.agent_context.runtime_resources
             )
@@ -349,6 +402,8 @@ class ExtractionAgent:
                     "df_chunks_clean debe ser un pandas.DataFrame."
                 )
 
+            # Construye la firma actual de la extracción usando la configuración,
+            # los modelos, los prompts, los esquemas y los artefactos de entrada.
             current_signature = (
                 build_current_extraction_signature(
                     experiment_id=agent_input.experiment_id,
@@ -411,6 +466,8 @@ class ExtractionAgent:
             previous_manifest = self.dependencies.load_json(
                 paths["EXTRACTION_MANIFEST_PATH"]
             )
+            # Define los archivos principales que deben existir para considerar
+            # completa y reutilizable una ejecución previa del Agente 03.
             required_outputs = [
                 paths[key]
                 for key in (
@@ -448,6 +505,8 @@ class ExtractionAgent:
                 "should_rebuild_extraction"
             ]
 
+            # Prepara los datos del intento anterior cuando el Agente 03 está en su
+            # intento final, recuperando fichas, errores y trazas para continuar la reparación.
             backup_dir_created: Path | None = None
             previous_cards_for_attempt2: list[dict[str, Any]] | None = None
             previous_errors_for_attempt2: list[dict[str, Any]] = []
@@ -485,7 +544,8 @@ class ExtractionAgent:
                     previous_trace_for_attempt2 = self.dependencies.load_dataframe(
                         previous_trace_path
                     ).to_dict(orient="records")
-
+            # Si la extracción debe reconstruirse, respalda los resultados anteriores,
+            # limpia las salidas de la etapa y prepara una nueva ejecución desde cero.
             if should_rebuild:
                 tracked_outputs = [
                     paths[key]
@@ -512,6 +572,8 @@ class ExtractionAgent:
                     if revision_path.exists():
                         revision_path.unlink()
 
+            # Registra si se reutilizaron o reconstruyeron resultados y si se creó
+            # un respaldo; luego valida los chunks limpios antes de continuar.
             metrics["technical"][
                 "reused_outputs"
             ] = not bool(should_rebuild)
@@ -545,6 +607,8 @@ class ExtractionAgent:
                 print_fn=self.dependencies.print_fn,
             )
 
+            # Obtiene los errores encontrados en la validación, registra cuántos hay
+            # y detiene la extracción si los chunks no son seguros para continuar. 
             validation_errors = list(
                 validation_report.get(
                     "errors",
@@ -560,6 +624,8 @@ class ExtractionAgent:
                     "para la extracción científica."
                 )
 
+            # Carga el manifiesto de Chroma y verifica que corresponda al experimento,
+            # a la colección configurada y a los chunks limpios usados por el Agente 03.
             chroma_manifest = self.dependencies.load_json(
                 chroma_reference.path
             )
@@ -572,6 +638,8 @@ class ExtractionAgent:
                 chunks_clean_path=chunks_reference.path,
             )
 
+            # Inicializa las estructuras que almacenarán los resultados de la extracción,
+            # las auditorías, los conteos de elegibilidad y las llamadas realizadas.
             extraction_errors: list[dict[str, Any]]
             retrieval_trace_rows: list[dict[str, Any]]
             cards: list[dict[str, Any]]
@@ -584,6 +652,8 @@ class ExtractionAgent:
             repair_calls = 0
             bad_after_repair: list[str] = []
 
+            # Si la etapa debe reconstruirse, obtiene la colección Chroma necesaria
+            # y verifica que estén disponibles las dependencias para generar la extracción.
             if should_rebuild:
                 collection = runtime_resources.get(
                     "collection"
@@ -597,6 +667,8 @@ class ExtractionAgent:
 
                 self._validate_generation_dependencies()
 
+                # Define una función de recuperación que busca los chunks más relevantes
+                # de un paper usando Chroma y la configuración RAG de la extracción.
                 def retrieve(*, source_filename: str, max_chunks: int) -> Any:
                     return retrieve_chunks_for_paper(
                         source_filename,
@@ -618,6 +690,8 @@ class ExtractionAgent:
                         str(value)
                         for value in df_chunks_clean["source_filename"].unique()
                     )
+                    # Ejecuta la extracción inicial de fichas científicas para todos los papers
+                    # y registra las fichas, trazas de recuperación, errores y llamadas realizadas.
                     extraction_created_at = self.dependencies.now_factory()
                     initial_result = self.dependencies.run_initial(
                         source_filenames,
@@ -645,8 +719,8 @@ class ExtractionAgent:
                     llm_calls += initial_calls
                     retrieval_rounds += len(source_filenames)
 
-                    # Repair simple missing titles before deciding whether the
-                    # whole stage needs a directed second attempt.
+                    # Repara títulos faltantes o incorrectos después de la extracción inicial
+                    # y actualiza las fichas, los errores y el número de llamadas al LLM.
                     title_result_initial = self.dependencies.run_title_repair(
                         cards,
                         df_chunks_clean=df_chunks_clean,
@@ -666,23 +740,12 @@ class ExtractionAgent:
                     llm_calls += title_calls_initial
 
                     # Exclusión determinista y auditable de reviews
-                    # (ver review_exclusion.py) -- ANTES del plan de
-                    # revisión, para que una review excluida nunca
-                    # genere una fila MISSING_CRITICAL_FIELDS por
-                    # carecer de resultados empíricos que nunca tuvo.
                     exclusion_policy = dict(
                         signature_policy.get("extraction_policy", {})
                     )
-                    # Fallback True: la fuente canónica de este
-                    # default (_DEFAULT_EXTRACTION_POLICY en
-                    # generation_policy_config.py) ya materializa
-                    # exclude_reviews=True para todo experimento nuevo
-                    # -- este fallback solo se alcanza si signature_
-                    # policy llegó sin pasar por esa fuente (ej. un
-                    # test que construye la policy a mano). Nunca
-                    # sobrescribe un override explícito: si la policy
-                    # SÍ trae exclude_reviews=False, .get() lo respeta
-                    # sin tocarlo.
+                    
+                    # Aplica la política de exclusión de papers de revisión,
+                    # actualiza las fichas y registra en la auditoría cuáles fueron excluidos.
                     exclusion_result_initial = apply_review_exclusion_policy(
                         cards,
                         exclude_reviews=bool(exclusion_policy.get("exclude_reviews", True)),
@@ -693,22 +756,8 @@ class ExtractionAgent:
                         exclusion_result_initial["audit_rows"]
                     )
 
-                    # PRE-ELIGIBILIDAD DOCUMENTAL (FASE 1, ver
-                    # corpus_eligibility.py) -- INMEDIATAMENTE después
-                    # del repair de título ya intentado, ANTES de que
-                    # build_revision_plan (el quality gate CIENTÍFICO)
-                    # se calcule por primera vez. Esto es lo que
-                    # corrige la causa raíz real: antes, una ficha con
-                    # título irrecuperable (ej. is_bad_card) llegaba
-                    # aquí y build_revision_plan la marcaba
-                    # MISSING_OR_INVALID_TITLE, forzando NEEDS_
-                    # REVISION/RETRY sin que el sistema tuviera
-                    # oportunidad de clasificarla QUARANTINE -- nunca
-                    # llegaba al bloque compartido donde antes vivía
-                    # el gate completo. Ahora se marca QUARANTINE (o
-                    # EXCLUDE si es review) AQUÍ MISMO, y build_
-                    # revision_plan (vía is_corpus_include) nunca la
-                    # ve como bloqueante.
+                    # Aplica una preclasificación documental para marcar papers que deben
+                    # incluirse, excluirse o enviarse a cuarentena antes del control de calidad científico.
                     pre_eligibility_result = apply_pre_eligibility_policy(
                         cards, created_at=self.dependencies.now_factory(),
                     )
@@ -717,6 +766,8 @@ class ExtractionAgent:
                         pre_eligibility_result["quarantine_audit_rows"]
                     )
 
+                    # Construye el plan de revisión y los reportes de las fichas extraídas,
+                    # guarda los resultados de la etapa.
                     revision_rows = build_revision_plan(
                         cards,
                         extraction_errors,
@@ -758,6 +809,8 @@ class ExtractionAgent:
                         "num_revision_plan_rows": len(revision_rows),
                     })
 
+                    # Si existen fichas que requieren revisión, identifica la causa principal,
+                    # clasifica el problema y solicita un único reintento de la etapa.
                     if revision_rows:
                         reason_codes = tuple(dict.fromkeys(
                             str(row["primary_reason_code"])
@@ -807,6 +860,8 @@ class ExtractionAgent:
                             error=None,
                         )
 
+                    # Prepara el segundo intento: reinicia los contadores de reparación y,
+                    # si corresponde, recupera las fichas, errores y trazas generados en el intento 1.
                     bad_after_repair = []
                     repair_calls = 0
                 else:
@@ -818,19 +873,8 @@ class ExtractionAgent:
                     extraction_errors = list(previous_errors_for_attempt2)
                     retrieval_trace_rows = list(previous_trace_for_attempt2)
 
-                    # PRE-ELIGIBILIDAD DOCUMENTAL (FASE 1) -- se
-                    # reaplica aquí, ANTES del build_revision_plan
-                    # temprano del intento 2, por robustez: si alguna
-                    # ficha llegó al intento 2 sin corpus_eligibility
-                    # ya resuelto (ej. otra ficha del mismo lote forzó
-                    # el RETRY desde el intento 1 por campos
-                    # faltantes, y esta viajó junto con fase 1 aún sin
-                    # aplicar), nunca debe evaluarse aquí como
-                    # bloqueante. Reaplicar sobre una ficha que YA
-                    # tiene corpus_eligibility resuelto es un no-op
-                    # seguro (classify_pre_eligibility es
-                    # determinista y no depende del campo ya
-                    # persistido).
+                    # Reaplica la preclasificación documental al inicio del intento 2
+                    # para asegurar que ninguna ficha no elegible bloquee la revisión científica.
                     pre_eligibility_result_attempt2 = apply_pre_eligibility_policy(
                         cards, created_at=self.dependencies.now_factory(),
                     )
@@ -839,6 +883,8 @@ class ExtractionAgent:
                         pre_eligibility_result_attempt2["quarantine_audit_rows"]
                     )
 
+                    # Construye el plan de revisión del intento 2, organiza las correcciones
+                    # por paper y guarda el plan actualizado para continuar con la reparación.
                     revision_rows = build_revision_plan(
                         cards,
                         extraction_errors,
@@ -880,6 +926,8 @@ class ExtractionAgent:
                     else:
                         title_calls = 0
 
+                    # Ejecuta las reparaciones dirigidas del intento 2 según el problema de cada paper,
+                    # amplía la evidencia cuando hace falta y actualiza fichas, trazas, errores y métricas.
                     repaired_sources: set[str] = set()
                     repair_calls = 0
                     by_source = {
@@ -943,6 +991,8 @@ class ExtractionAgent:
                             and str(row.get("stage", "")) == "initial_extraction"
                         )
                     ]
+                    # Verifica qué fichas siguen siendo inválidas después de la reparación,
+                    # guarda los resultados finales y actualiza las métricas del intento 2.
                     bad_after_repair = [
                         str(card.get("source_filename", ""))
                         for card in cards
@@ -968,6 +1018,9 @@ class ExtractionAgent:
                         "num_directed_repair_calls": repair_calls,
                         "num_revision_plan_rows": len(revision_rows),
                     })
+           
+            # Si el agente NO necesita volver a hacer la extracción desde cero, reutiliza las fichas, trazas y errores
+            # ya guardados en disco y reinicia los indicadores para las validaciones siguientes.
             else:
                 cards = self.dependencies.load_jsonl(
                     paths["CARDS_JSONL_PATH"]
@@ -1001,16 +1054,8 @@ class ExtractionAgent:
             title_calls = 0
             cards_need_classification = False
 
-            # Problema 2 (regresión de artefactos desfasados): summary/
-            # quality YA NO se construyen ni se guardan aquí -- se
-            # reconstruyen al FINAL de este bloque, después de TODAS
-            # las mutaciones finales de la ficha (repair de extracción,
-            # title repair, clasificación de relevancia y exclusión de
-            # reviews), para que scientific_cards_quality_check.csv y
-            # el summary reflejen exactamente las fichas committed
-            # (ver el bloque "Ensure the primary card/error/trace
-            # artifacts exist" más abajo).
-
+            # Revisa y repara nuevamente los títulos de las fichas, actualiza los errores
+            # y registra cuántas fichas necesitaron reparación y cuántas llamadas al LLM se usaron.
             title_result = (
                 self.dependencies.run_title_repair(
                     cards,
@@ -1064,6 +1109,8 @@ class ExtractionAgent:
                 ),
             })
 
+            # Guarda las fichas si hubo reparaciones de título y determina
+            # si deben volver a clasificarse por relevancia.
             if title_result["repair_titles"]:
                 self.dependencies.save_jsonl(
                     cards,
@@ -1092,6 +1139,8 @@ class ExtractionAgent:
                 cards_need_classification
             )
 
+            # Si las fichas necesitan reclasificarse y no se está reconstruyendo toda la etapa,
+            # crea un respaldo de los resultados existentes antes de modificarlos.           
             if (
                 reclassify_relevance
                 and not should_rebuild
@@ -1118,6 +1167,8 @@ class ExtractionAgent:
                         "backup_created"
                     ] = True
 
+            # Inicializa los contadores de clasificación y determina si la base de conocimiento
+            # debe recrearse; si hay que reclasificar relevancia, valida sus dependencias.
             classification_calls = 0
             kb_should_recreate = bool(
                 should_rebuild
@@ -1125,6 +1176,8 @@ class ExtractionAgent:
             if reclassify_relevance:
                 self._validate_classification_dependencies()
 
+                # Define una función que clasifica la relevancia de una ficha científica
+                # usando el perfil del experimento, el prompt configurado y el LLM principal.
                 def classify(
                     card: dict[str, Any],
                 ) -> Any:
@@ -1157,16 +1210,9 @@ class ExtractionAgent:
                         ),
                     )
                 )
-                # Fichas YA excluidas de forma determinista (Paso 1,
-                # intento 1) o ya QUARANTINADAS en FASE 1 de pre-
-                # eligibilidad (título irrecuperable/evidencia
-                # insuficiente -- ver corpus_eligibility.py) NUNCA se
-                # pasan al clasificador LLM de relevancia -- ni gastan
-                # una llamada innecesaria, ni arriesgan que su
-                # include_in_state_of_art/relevance_level/task_type
-                # sean sobrescritos por una reclasificación que no las
-                # considera. Se recombinan aquí, preservadas intactas,
-                # en su posición original.
+                
+                # Conserva intactas las fichas ya excluidas o en cuarentena, integra la
+                # clasificación de relevancia del resto y actualiza errores, métricas y la KB.
                 classified_by_source = {
                     str(c.get("source_filename", "")): c
                     for c in relevance_result["cards"]
@@ -1214,24 +1260,13 @@ class ExtractionAgent:
                     policy["error_columns"],
                 )
 
-            # Exclusión determinista y auditable de reviews (ver
-            # review_exclusion.py) -- ÚLTIMA mutación de la ficha antes
-            # de que la KB/summary/quality se construyan, para que
-            # todas reflejen exactamente el estado final: repair de
-            # extracción + title repair + clasificación de relevancia
-            # + exclusión, en ese orden. Fichas ya excluidas en el
-            # intento 1 (marcadas por review_exclusion.py) se vuelven a
-            # evaluar aquí sin cambiar su resultado -- la clasificación
-            # es puramente determinista sobre paper_type/task_type, así
-            # que reclasificar una ficha ya excluida es un no-op seguro.
+            # Aplica por última vez la exclusión determinista de papers de revisión,
+            # guarda las fichas finales y marca que la KB debe recrearse si hubo exclusiones.
             exclusion_policy_final = dict(
                 signature_policy.get("extraction_policy", {})
             )
             exclusion_result_final = apply_review_exclusion_policy(
                 cards,
-                # Mismo fallback True sincronizado con la fuente
-                # canónica (_DEFAULT_EXTRACTION_POLICY) -- ver
-                # comentario equivalente en el intento 1, arriba.
                 exclude_reviews=bool(exclusion_policy_final.get("exclude_reviews", True)),
                 created_at=self.dependencies.now_factory(),
             )
@@ -1246,18 +1281,8 @@ class ExtractionAgent:
                     paths["CARDS_JSONL_PATH"],
                 )
 
-            # Corpus eligibility gate (ver corpus_eligibility.py) --
-            # ÚLTIMA clasificación antes del quality gate científico,
-            # justo después de que title repair, exclusión de reviews
-            # y clasificación de relevancia YA están completas (todas
-            # las señales que reutiliza están disponibles recién
-            # aquí). Persiste el estado canónico INCLUDE/EXCLUDE/
-            # QUARANTINE en cada card -- fuente única que build_
-            # revision_plan, KB, summary, quality y manifest deben
-            # consumir para no divergir entre sí. Un documento
-            # individual no útil o no validable (QUARANTINE) nunca
-            # detiene todo el corpus: solo se audita, nunca entra al
-            # plan de revisión.
+            # Aplica la clasificación final de elegibilidad del corpus y asigna a cada
+            # ficha un estado canónico: INCLUDE, EXCLUDE o QUARANTINE.
             eligibility_result = apply_corpus_eligibility_policy(
                 cards, created_at=self.dependencies.now_factory(),
             )
@@ -1268,20 +1293,13 @@ class ExtractionAgent:
             )
             if eligibility_result["quarantine_audit_rows"]:
                 kb_should_recreate = True
-            # El JSONL se guarda SIEMPRE aquí, incondicionalmente --
-            # antes solo se guardaba si había QUARANTINE nuevas, lo
-            # que dejaba el JSONL en disco con el valor de FASE 1
-            # (CANDIDATE) en vez del valor FINAL de FASE 2 (INCLUDE)
-            # para cualquier corrida sin ninguna card en cuarentena.
-            # corpus_eligibility es el campo canónico que consumen
-            # revision_plan/KB/summary/quality/manifest -- debe
-            # quedar sincronizado en disco siempre, no solo cuando
-            # cambia el conteo de exclusiones.
+                
+            # Guarda siempre las fichas con su estado final de elegibilidad
+            # y reutiliza la KB existente solo si está completa y no necesita reconstruirse.
             self.dependencies.save_jsonl(
                 cards,
                 paths["CARDS_JSONL_PATH"],
             )
-
             kb_csv_exists = Path(
                 paths["KB_CSV_PATH"]
             ).exists()
@@ -1299,7 +1317,9 @@ class ExtractionAgent:
                         paths["KB_CSV_PATH"]
                     )
                 )
-
+                
+            # Ejecuta la construcción o reutilización de la Knowledge Base y,
+            # si fue creada nuevamente, guarda sus versiones CSV y JSONL.
             (
                 kb_status,
                 df_kb,
@@ -1325,6 +1345,8 @@ class ExtractionAgent:
                     paths["KB_JSONL_PATH"],
                 )
 
+            # Actualiza las métricas científicas finales de la etapa de extracción
+            # con los conteos de fichas, KB, errores, reparaciones y clasificaciones.
             metrics["scientific"].update({
                 "num_cards": int(
                     len(cards)
@@ -1356,12 +1378,8 @@ class ExtractionAgent:
                 "kb_status": kb_status,
             })
 
-            # Problema 2: summary/quality se (re)construyen AQUÍ,
-            # después de TODAS las mutaciones finales de la ficha
-            # (repair de extracción, title repair, clasificación de
-            # relevancia, exclusión de reviews) -- reflejan exactamente
-            # las fichas finales committed en scientific_cards.jsonl,
-            # nunca una versión intermedia desfasada.
+            # Construye y guarda los reportes finales de resumen y calidad
+            # usando las fichas definitivas después de todas las correcciones y filtros.
             summary_rows = [
                 build_summary_row(card) for card in cards
             ]
@@ -1377,25 +1395,8 @@ class ExtractionAgent:
                 paths["CARDS_QUALITY_CSV_PATH"],
             )
 
-            # Mismo bug de sincronización que Problema 2, aplicado al
-            # plan de revisión: scientific_cards_revision_plan.csv se
-            # escribía UNA SOLA VEZ, al comienzo del intento 2 (para
-            # decidir qué reparar: title_sources, etc.), usando las
-            # cards TAL COMO llegaron del intento 1 -- ANTES de title
-            # repair del intento 2, de la reclasificación de
-            # relevancia y de la exclusión de reviews. El archivo en
-            # disco quedaba desactualizado (fichas ya excluidas como
-            # review seguían apareciendo como "inválidas" bloqueantes,
-            # con el esquema de columnas viejo) aunque la DECISIÓN del
-            # agente (quality_status, vía _scientific_reason_codes)
-            # siempre recalculó correctamente sobre las cards finales
-            # en memoria -- este bloque sincroniza también el artefacto
-            # persistido, reconstruyéndolo aquí con las mismas cards
-            # finales ya usadas para summary/quality/manifest. Un
-            # EXCLUDE confirmado nunca vuelve a aparecer (build_
-            # revision_plan ya lo salta, ver revision_strategy.py);
-            # una ficha UNKNOWN inválida aparece con primary_reason_
-            # code=DOCUMENT_TYPE_UNKNOWN_AND_CARD_INVALID.
+            # Reconstruye y guarda el plan de revisión usando las fichas finales,
+            # para que el archivo refleje exactamente el estado definitivo del corpus.
             revision_rows_final = build_revision_plan(
                 cards, extraction_errors, retrieval_trace_rows,
             )
@@ -1404,13 +1405,8 @@ class ExtractionAgent:
                 paths["CARDS_REVISION_PLAN_CSV_PATH"],
             )
 
-            # Registro auditable de exclusión (fail-closed, nunca
-            # silencioso): source_filename, tipo detectado, motivo y
-            # regla de policy aplicada. Una ficha puede evaluarse en
-            # más de un punto del flujo (intento 1 y este bloque
-            # final) -- se conserva solo la evaluación MÁS RECIENTE por
-            # source_filename (el estado definitivo), nunca duplicados
-            # de la misma ficha.
+            # Elimina registros duplicados de la auditoría de exclusión y conserva
+            # únicamente la evaluación más reciente de cada paper antes de guardarla.
             deduplicated_audit_rows: dict[str, dict[str, Any]] = {}
             for row in review_exclusion_audit_rows:
                 deduplicated_audit_rows[str(row.get("source_filename", ""))] = row
@@ -1420,11 +1416,8 @@ class ExtractionAgent:
                 EXCLUSION_AUDIT_COLUMNS,
             )
 
-            # Registro auditable de QUARANTINE (fail-closed, nunca
-            # silencioso): título/metadata irrecuperable, contenido
-            # insuficiente o relevancia indeterminable, para revisión
-            # humana -- ver corpus_eligibility.py. Misma deduplicación
-            # por source_filename que el audit de exclusión.
+            # Elimina registros duplicados de cuarentena y guarda una sola entrada final
+            # por paper para mantener una auditoría clara de los documentos no utilizables.
             deduplicated_quarantine_rows: dict[str, dict[str, Any]] = {}
             for row in quarantine_audit_rows:
                 deduplicated_quarantine_rows[str(row.get("source_filename", ""))] = row
@@ -1434,6 +1427,8 @@ class ExtractionAgent:
                 QUARANTINE_AUDIT_COLUMNS,
             )
 
+            # Calcula las métricas finales del corpus: cuántos papers se procesaron,
+            # incluyeron, excluyeron o quedaron en cuarentena, y por qué motivo.
             papers_processed = len(cards)
             papers_excluded_by_review_policy = sum(
                 1 for card in cards if is_review_excluded(card)
@@ -1459,11 +1454,6 @@ class ExtractionAgent:
                         if str(row.get("action")) == "UNCERTAIN"
                     )
                 ),
-                # Corpus eligibility gate -- fuente canónica: cada
-                # ficha está en EXACTAMENTE uno de estos tres estados
-                # (corpus_eligibility.py), independientemente de las
-                # métricas históricas de arriba (que combinan EXCLUDE
-                # y QUARANTINE bajo include_in_state_of_art=False).
                 "papers_corpus_include": int(
                     corpus_eligibility_counts.get("include", 0)
                 ),
@@ -1475,15 +1465,8 @@ class ExtractionAgent:
                 ),
             })
 
-            # HALT global por condición SISTÉMICA (nunca por un
-            # documento individual): sin ningún documento elegible
-            # (INCLUDE), Stage03 no tiene corpus con el que continuar
-            # -- esto es un fallo del CORPUS COMPLETO, no de una ficha
-            # aislada, y por eso sí detiene la etapa. El mínimo
-            # configurable (extraction_policy.corpus_eligibility_
-            # policy.min_include_corpus_size, default 1 -- exigir al
-            # menos un documento) permite a cada experimento declarar
-            # un umbral más estricto sin cambiar código.
+            # Verifica que exista un número mínimo de papers elegibles en el corpus;
+            # si no se cumple, detiene la etapa porque no hay corpus suficiente para continuar.
             corpus_eligibility_policy = dict(
                 exclusion_policy_final.get("corpus_eligibility_policy", {})
             )
@@ -1526,8 +1509,8 @@ class ExtractionAgent:
                     completed_at=self.dependencies.now_factory(),
                 )
 
-            # Ensure the primary card/error/trace artifacts exist before the
-            # manifest and audit, including current-output reuse.
+            # Verifica que existan los archivos principales de fichas, errores y trazas;
+            # si alguno falta, lo crea antes de generar el manifiesto y la auditoría final.
             if not Path(
                 paths["CARDS_JSONL_PATH"]
             ).exists():
@@ -1554,6 +1537,8 @@ class ExtractionAgent:
                     policy["trace_columns"],
                 )
 
+            # Construye y guarda el manifiesto final de la extracción con la configuración,
+            # estado, métricas, firmas, políticas, validaciones y artefactos usados.
             trace_dataframe = pd.DataFrame(
                 retrieval_trace_rows,
                 columns=policy["trace_columns"],
@@ -1626,6 +1611,8 @@ class ExtractionAgent:
                 ],
             )
 
+            # Restaura y guarda el reporte de validación de los chunks
+            # para conservar el resultado de la validación realizada al inicio.
             restore_validation_report(
                 validation_report,
                 paths[
@@ -1639,6 +1626,8 @@ class ExtractionAgent:
                 ),
             )
 
+            # Revisa que todos los artefactos finales existan y ejecuta una auditoría
+            # de consistencia entre chunks, fichas, trazas y manifiesto de extracción.
             outputs = [
                 paths[key]
                 for key in FINAL_OUTPUT_KEYS
@@ -1671,6 +1660,8 @@ class ExtractionAgent:
             )
             validation_calls += 1
 
+            # Convierte los errores de extracción en advertencias y añade una alerta
+            # adicional si todavía quedan fichas inválidas después de la reparación.
             for error_row in extraction_errors:
                 warnings.append(
                     self._warning_from_error_row(
@@ -1694,6 +1685,8 @@ class ExtractionAgent:
                     )
                 )
 
+            # Junta los archivos finales, mide qué tan completas quedaron las fichas
+            # y revisa si todavía existen problemas o si hace falta revisión humana.
             output_artifacts = self._collect_output_artifacts(
                 paths
             )
@@ -1718,15 +1711,19 @@ class ExtractionAgent:
                 cards=cards,
                 bad_after_repair=bad_after_repair,
                 extraction_errors=extraction_errors,
-            )  # Bloque D, D2 -- extracción mecánica; misma lógica exacta ahora en _compute_reason_codes_and_manual_review_eligibility.
+            ) 
 
+            # Decide el estado final de calidad de la extracción
+            # y qué debe hacer el pipeline después.
             quality_status, transition = self._decide_final_quality_status_and_transition(
                 reason_codes=reason_codes,
                 can_manual=can_manual,
                 has_warnings=has_warnings,
                 agent_input=agent_input,
-            )  # Bloque D, D1 -- extracción mecánica; misma lógica exacta ahora en _decide_final_quality_status_and_transition.
+            )  
 
+            # Devuelve al orquestador el resultado final de la etapa,
+            # con su calidad, métricas, advertencias, archivos generados y la acción siguiente.
             return AgentResult(
                 execution_status=ExecutionStatus.COMPLETED,
                 quality_status=quality_status,
@@ -1756,6 +1753,8 @@ class ExtractionAgent:
                 error=None,
             )
 
+        # Si ocurre un error inesperado, registra la hora de finalización
+        # e intenta recuperar los artefactos que ya se alcanzaron a generar.
         except Exception as error:
             completed_at = (
                 self.dependencies.now_factory()
@@ -1791,6 +1790,8 @@ class ExtractionAgent:
                 "artifact_count"
             ] = len(output_artifacts)
 
+            # Si la etapa falla, devuelve un resultado de error al orquestador,
+            # registra el problema y solicita detener el Agente 03.
             return AgentResult(
                 execution_status=(
                     ExecutionStatus.FAILED
@@ -1850,32 +1851,23 @@ class ExtractionAgent:
                 },
             )
 
+    # Construye la fila de calidad de una ficha, identifica qué campos críticos
+    # faltan y registra si el paper fue excluido por la política de reviews.
     @staticmethod
     def _quality_row(card: Mapping[str, Any]) -> dict[str, Any]:
         row = build_quality_row(dict(card))
         missing = missing_critical_fields(card)
         row["missing_fields"] = missing
         row["num_missing_fields"] = len(missing)
-        # Campo interno, NUNCA persistido en el CSV (build_quality_row
-        # ya fija sus propias claves y el DataFrame final se construye
-        # con columns=QUALITY_COLUMNS explícito, que no lo incluye) --
-        # permite que _critical_field_coverage excluya del cálculo las
-        # fichas marcadas por review_exclusion.py sin necesitar
-        # recorrer `cards` de nuevo ni acoplar ambos módulos más de lo
-        # necesario.
         row["_excluded_by_policy_rule"] = is_review_excluded(card)
         return row
 
+    # Calcula qué tan completas quedaron las fichas incluidas,
+    # sin contar las reviews que ya fueron excluidas.
     @staticmethod
     def _critical_field_coverage(
         quality_rows: Sequence[Mapping[str, Any]],
     ) -> float:
-        # Fichas excluidas de forma determinista y auditable (reviews
-        # bajo policy.exclude_reviews) nunca penalizan la cobertura de
-        # campos críticos -- carecer de methods_or_models/evaluation_
-        # metrics/main_results en una review excluida no es un defecto
-        # de extracción, así que no debe empujar el gate hacia NEEDS_
-        # REVISION/HALT_STAGE.
         included_rows = [
             row for row in quality_rows if not row.get("_excluded_by_policy_rule")
         ]
@@ -1888,6 +1880,8 @@ class ExtractionAgent:
         ]
         return sum(covered) / len(covered)
 
+    # Revisa la cobertura y los problemas de las fichas para decidir
+    # qué códigos de error quedan y si el caso puede pasar a revisión manual.
     @staticmethod
     def _compute_reason_codes_and_manual_review_eligibility(
         *,
@@ -1951,6 +1945,8 @@ class ExtractionAgent:
 
         return reason_codes, can_manual
 
+    # Decide cómo termina la etapa según los problemas encontrados:
+    # reintenta, pide revisión humana, rechaza o avanza.
     @staticmethod
     def _decide_final_quality_status_and_transition(
         *,
@@ -1971,21 +1967,6 @@ class ExtractionAgent:
         """
 
         if reason_codes:
-            # El intento 1 SIEMPRE tiene derecho a un RETRY antes
-            # de cualquier decisión final (HALT/REJECTED/APPROVED_
-            # PENDING_MANUAL_REVIEW) -- histórico: antes de la
-            # pre-eligibilidad documental (FASE 1), el intento 1
-            # NUNCA llegaba hasta aquí con reason_codes de campos
-            # faltantes (siempre retornaba temprano con NEEDS_
-            # REVISION/RETRY, ver el bloque de arriba). Ahora que
-            # el intento 1 SIEMPRE atraviesa este bloque (revision_
-            # rows del camino temprano queda vacío al filtrar
-            # EXCLUDE/QUARANTINE, ver corpus_eligibility.py), este
-            # chequeo restaura exactamente ese comportamiento de
-            # dos intentos para reason_codes que SÍ pueden
-            # repararse con un segundo intento (título ya fue
-            # resuelto en FASE 1 -- solo quedan campos científicos
-            # de fichas ya confirmadas INCLUDE).
             if agent_input.is_first_attempt():
                 quality_status = QualityStatus.NEEDS_REVISION
                 transition = RequestedTransition(
@@ -2029,6 +2010,8 @@ class ExtractionAgent:
 
         return quality_status, transition
 
+    # Detecta los problemas de calidad que todavía tienen las fichas
+    # y devuelve una lista de esos problemas sin repetirlos.
     @staticmethod
     def _scientific_reason_codes(
         *,
@@ -2047,6 +2030,8 @@ class ExtractionAgent:
         ]
         return tuple(dict.fromkeys(codes))
 
+    # Clasifica un error técnico según su causa:
+    # dependencia faltante, dependencia incorrecta o error general de ejecución.
     @staticmethod
     def _technical_failure_reason_codes(error: Exception) -> tuple[str, ...]:
         text = str(error).casefold()
@@ -2059,14 +2044,18 @@ class ExtractionAgent:
             return ("DEPENDENCY_MISMATCH",)
         return ("EXECUTION_ERROR",)
 
+
     @staticmethod
+    # Evita mostrar información sensible, como claves de API,
+    # dentro de los mensajes de error.
     def _sanitize_error_message(error: Exception) -> str:
         text = str(error)
         for marker in ("sk-", "OPENAI_API_KEY", "openai_api_key.key", "openai_api_key.enc"):
             if marker in text:
                 return "Error técnico sanitizado durante la etapa 03."
         return text
-
+    # Verifica que la entrada recibida por el Agente 03 sea válida,
+    # corresponda a esta etapa y tenga las dependencias necesarias.
     def _validate_agent_input(
         self,
         agent_input: AgentInput,
@@ -2110,7 +2099,8 @@ class ExtractionAgent:
                 "Faltan dependencias obligatorias: "
                 + ", ".join(missing)
             )
-
+    # Lee y valida las rutas de archivos configuradas
+    # para la etapa de extracción.
     def _resolve_paths(
         self,
         policy: Mapping[str, Any],
@@ -2136,6 +2126,8 @@ class ExtractionAgent:
                 )
         return paths
 
+    # Comprueba que una dependencia exista
+    # y que su archivo no haya cambiado.
     def _validate_dependency(
         self,
         name: str,
@@ -2158,6 +2150,8 @@ class ExtractionAgent:
                 f"'{name}'."
             )
 
+    # Verifica que Chroma corresponda al experimento,
+    # colección y archivo de chunks correctos.
     def _validate_chroma_manifest(
         self,
         *,
@@ -2207,6 +2201,8 @@ class ExtractionAgent:
                 "usado por el agente 03."
             )
 
+    # Comprueba que estén disponibles el LLM y el prompt
+    # necesarios para generar o reconstruir la extracción.
     def _validate_generation_dependencies(
         self,
     ) -> None:
@@ -2229,6 +2225,8 @@ class ExtractionAgent:
                 "obligatorio para reconstruir."
             )
 
+    # Comprueba que estén disponibles el LLM y el prompt
+    # necesarios para clasificar la relevancia de las fichas.
     def _validate_classification_dependencies(
         self,
     ) -> None:
@@ -2246,6 +2244,8 @@ class ExtractionAgent:
                 "obligatorio para clasificar."
             )
 
+    # Recopila los archivos finales generados por la etapa
+    # y guarda una referencia y hash de cada uno.
     def _collect_output_artifacts(
         self,
         paths: Mapping[str, Path],
@@ -2271,6 +2271,8 @@ class ExtractionAgent:
                 )
         return artifacts
 
+    # Busca un dato dentro de la configuración
+    # y verifica que sea un diccionario.
     @staticmethod
     def _require_mapping(
         mapping: Mapping[str, Any],
@@ -2285,7 +2287,9 @@ class ExtractionAgent:
                 f"{key} debe ser un mapping."
             )
         return value
-
+        
+    # Verifica que la configuración tenga todos los datos obligatorios.
+    # Si falta alguno, genera un error indicando cuál falta.
     @staticmethod
     def _validate_mapping_keys(
         mapping: Mapping[str, Any],
@@ -2302,7 +2306,9 @@ class ExtractionAgent:
                 f"Faltan claves en {label}: "
                 + ", ".join(missing)
             )
-
+    
+    # Convierte un error de extracción en una advertencia
+    # para informar el problema sin detener el pipeline.
     @staticmethod
     def _warning_from_error_row(
         error_row: Mapping[str, Any],
