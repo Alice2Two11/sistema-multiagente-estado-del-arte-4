@@ -951,11 +951,11 @@ def _reconcile_pending_execution_for_other_stage(
     attempt_numbers: Mapping[str, int],
     observations: Mapping[str, Any] | None,
 ) -> tuple[list["StageOutcome"], bool]:
-   """Reconcilia una ejecución pendiente de otra etapa antes de continuar con
+    """Reconcilia una ejecución pendiente de otra etapa antes de continuar con
       la etapa actual. Usa el protocolo oficial de esa etapa mediante run_stage()
       para resolverla correctamente y evita que el slot global pending_execution
       bloquee el pipeline. Devuelve los resultados generados y si debe detenerse.
-   """
+    """
     state = store.load()
     pending = state.pending_execution
     if pending is None or pending.target_stage == current_stage:
@@ -1022,11 +1022,11 @@ def _apply_stage_transition(
     until: str | None,
     outcomes: list["StageOutcome"],
 ) -> tuple[str | None, bool]:
-   """Interpreta la acción indicada por una etapa y decide cuál debe ser
+    """Interpreta la acción indicada por una etapa y decide cuál debe ser
       la siguiente etapa del pipeline o si la ejecución debe detenerse.
       Aplica la misma lógica para ADVANCE, RETRY, RETURN y HALT/STOP,
       incluso cuando la etapa fue reconciliada fuera del flujo normal.
-   """
+    """
 
     if until is not None and stage_key == until:
         return None, True
@@ -1090,12 +1090,12 @@ from src.orchestration.decision_log_frontier import (
 def _check_already_terminal_state(
     *, store, registry: Mapping[str, "StageSpec"], start_stage: str | None, force_rerun: bool
 ) -> "StageOutcome | None":
-   """Detecta si el pipeline ya quedó detenido de forma terminal según la
+    """Detecta si el pipeline ya quedó detenido de forma terminal según la
       decisión autoritativa registrada en el decision_log. Si la última decisión
       válida fue HALT_STAGE o STOP_PIPELINE, reconstruye ese resultado terminal
       desde el AgentResult histórico correspondiente y evita reiniciar etapas
       innecesariamente o mezclarlo con estados posteriores inconsistentes.
-   """
+    """
 
     if start_stage is not None or force_rerun:
         return None
@@ -1139,7 +1139,7 @@ def run_pipeline(
        ADVANCE para avanzar, RETRY para repetir, RETURN para volver e invalidar
        etapas posteriores, y HALT_STAGE/STOP_PIPELINE para detenerse. También permite
        parar en una etapa específica con `until` y aplicar `force_rerun` solo al inicio.
-      """
+    """
     attempt_numbers = dict(attempt_numbers or {})
     store = ensure_pipeline_state(project_dir)
     registry = {spec.key: spec for spec in _stage_registry()}
