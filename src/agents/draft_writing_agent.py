@@ -1,14 +1,20 @@
-from __future__ import annotations
+# ============================================================
+# 06 - AGENTE REDACTOR DEL ESTADO DEL ARTE
+# Redacta el borrador del estado del arte a partir del esquema
+# y de la evidencia científica disponible.
+# ============================================================
 
+from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
 import re
 from typing import Any, Mapping, Sequence
-
 import pandas as pd
 
+# Importa los contratos y herramientas que necesita el agente 06
+# para redactar, recuperar evidencia, validar, reparar y guardar el borrador.
 from src.contracts.agent_input import ArtifactReference
 from src.contracts.agent_result import (
     AgentResult,
@@ -62,81 +68,31 @@ from src.tools.draft_writing.validation import (
 )
 from src.tools.draft_writing.length_repair import attempt_directed_length_repair
 
-
-LEGACY_RETRIEVAL_STRATEGY = "legacy_chroma_then_csv_restricted"
-HYBRID_RETRIEVAL_STRATEGY = "hybrid_chroma_csv_rrf_balanced"
-
-# Fase 1 de aislamiento del contrato canónico sentences[] (V2) --
-# únicamente la bifurcación mínima: la ausencia del flag y el valor
-# "legacy" explícito son EQUIVALENTES y producen exactamente el
-# comportamiento histórico (el código legacy de abajo no se mueve, no
-# se extrae, no se reindenta). El camino V2 (canonical_sentences.py)
-# solo se invoca cuando la policy lo selecciona explícitamente -- ver
-# tests LEGACY01-08.
+# Define las dos estrategias de recuperación de evidencia disponibles para la redacción de las secciones del estado del arte.
+LEGACY_RETRIEVAL_STRATEGY = "legacy_chroma_then_csv_restricted" #primero busca en Chroma y luego usa el CSV restringido
+HYBRID_RETRIEVAL_STRATEGY = "hybrid_chroma_csv_rrf_balanced" #combina resultados de Chroma + CSV y los fusiona de forma balanceada mediante RRF (combinar varios rankings de resultados en uno solo.)
+# Define el contrato histórico y el contrato canónico de representación del borrador; el legacy se mantiene por compatibilidad del pipeline.
 LEGACY_DRAFT_REPRESENTATION_CONTRACT = "legacy"
 CANONICAL_SENTENCES_DRAFT_REPRESENTATION_CONTRACT = "canonical_sentences_v2"
-
-# Reason codes de longitud (Stage 06, corrección del gate configured_
-# min_total_words/configured_max_total_words) -- nunca genéricos bajo
-# INVALID_DRAFT, para que el motivo real (déficit, exceso, o evidencia
-# insuficiente tras intentar reparar) sea auditable explícitamente.
+# Define códigos de validación relacionados con la longitud total del borrador y con la falta de contenido respaldado suficiente para alcanzar el mínimo.
 TOTAL_WORD_COUNT_BELOW_MINIMUM = "TOTAL_WORD_COUNT_BELOW_MINIMUM"
 TOTAL_WORD_COUNT_ABOVE_MAXIMUM = "TOTAL_WORD_COUNT_ABOVE_MAXIMUM"
 INSUFFICIENT_SUPPORTED_CONTENT_FOR_MIN_LENGTH = "INSUFFICIENT_SUPPORTED_CONTENT_FOR_MIN_LENGTH"
-
+# Registra las versiones históricas de los componentes usados por el agente 06
+# para mantener trazabilidad y compatibilidad con ejecuciones anteriores
 LEGACY_VERSIONS = {
     "stage_version": "06_AGENTIC_V16_BEHAVIOR_PRESERVING",
     "rag_version": "legacy_chroma_then_csv_restricted_v1",
-    # v2 (sufijo "_hard_word_range_configured_min_gate_soft_failure_
-    # length_repair"): el gate de longitud total del borrador cambió de
-    # contrato -- antes, global_length_valid podía aprobarse usando
-    # effective_min_total_words (rebajado silenciosamente por número de
-    # secciones source-free), permitiendo que un borrador muy por
-    # debajo de min_total_words configurado (ej. 1081 con
-    # configured_min=1300) se aprobara. Desde esta versión:
-    # configured_min_total_words/configured_max_total_words (los
-    # valores reales del generation_profile) son el único gate;
-    # incumplir el rango produce reason codes explícitos
-    # (TOTAL_WORD_COUNT_BELOW_MINIMUM/ABOVE_MAXIMUM/INSUFFICIENT_
-    # SUPPORTED_CONTENT_FOR_MIN_LENGTH) en vez de INVALID_DRAFT
-    # genérico, nunca una excepción técnica, y se intenta una
-    # reparación dirigida (src/tools/draft_writing/length_repair.py,
-    # exclusivamente dentro del contrato Evidence Handles V2) antes de
-    # agotar los intentos. Este es un cambio de CONTRATO real -- por
-    # eso participa en el fingerprint (ver _draft_signature) e invalida
-    # cualquier draft/manifest de 06 producido bajo una versión
-    # anterior, sin necesitar --force-rerun.
     "validation_version": "legacy_notebook06_validation_v2_hard_word_range_configured_min_gate_soft_failure_length_repair",
-    # LEGACY_VERSIONS es la fuente canónica única -- src/adapters/
-    # draft_writing_runtime.py ya no define su propia copia; importa
-    # este mismo dict con alias (LEGACY_RUNTIME_VERSIONS). Antes eran
-    # dos copias idénticas mantenidas a mano en paralelo.
     "normalization_version": "sentence_claim_exact_match_preserve_unmatched_v1_immediate_numeric_salvage_v2_discourse_connector_feedback_v3",
 }
+# Registra las versiones de los componentes usados por la estrategia híbrida
+# del agente 06 para mantener trazabilidad y reproducibilidad.
 HYBRID_VERSIONS = {
     "stage_version": "06_AGENTIC_V17_HYBRID_QUANTITATIVE_SOURCE_AWARE",
     "rag_version": "hybrid_chroma_csv_rrf_balanced_v1",
     "quantitative_selection_version": "confirmed_literal_greedy_coverage_v1",
     "budget_version": "source_aware_exact_total_v1",
-    # v2 (sufijo "_hard_word_range_configured_min_gate_soft_failure_
-    # length_repair"): el gate de longitud total del borrador cambió de
-    # contrato -- antes, global_length_valid podía aprobarse usando
-    # effective_min_total_words (rebajado silenciosamente por número de
-    # secciones source-free), permitiendo que un borrador muy por
-    # debajo de min_total_words configurado (ej. 1081 con
-    # configured_min=1300) se aprobara. Desde esta versión:
-    # configured_min_total_words/configured_max_total_words (los
-    # valores reales del generation_profile) son el único gate;
-    # incumplir el rango produce reason codes explícitos
-    # (TOTAL_WORD_COUNT_BELOW_MINIMUM/ABOVE_MAXIMUM/INSUFFICIENT_
-    # SUPPORTED_CONTENT_FOR_MIN_LENGTH) en vez de INVALID_DRAFT
-    # genérico, nunca una excepción técnica, y se intenta una
-    # reparación dirigida (src/tools/draft_writing/length_repair.py,
-    # exclusivamente dentro del contrato Evidence Handles V2) antes de
-    # agotar los intentos. Este es un cambio de CONTRATO real -- por
-    # eso participa en el fingerprint (ver _draft_signature) e invalida
-    # cualquier draft/manifest de 06 producido bajo una versión
-    # anterior, sin necesitar --force-rerun.
     "validation_version": "legacy_notebook06_validation_v2_hard_word_range_configured_min_gate_soft_failure_length_repair",
     "normalization_version": "sentence_claim_exact_match_preserve_unmatched_v1_immediate_numeric_salvage_v2_discourse_connector_feedback_v3",
 }
@@ -670,10 +626,6 @@ class DraftWritingAgent:
 
         if bool(salvage_validation.get("validation_ok")):
             return salvaged_section, log_entry, 1
-        # El salvage se intentó y quedó registrado para auditoría, pero
-        # no logró pasar la validación completa -- se descarta como
-        # sección aceptada; el llamador sigue con el siguiente intento
-        # normal (fail-closed: nunca se acepta un salvage que no valida).
         return None, log_entry, 1
 
     def execute(self, agent_input):
@@ -682,31 +634,6 @@ class DraftWritingAgent:
         retrieval_rounds = 0
         validation_calls = 0
         out = Path(agent_input.agent_context.output_directory)
-        # Versionado por intento EXTERNO del orquestador (agent_input.
-        # attempt_number) -- distinto del contador interno de reintentos
-        # por sección (generation_attempt, usado en el nombre de cada
-        # archivo dentro de este subdirectorio). Sin esto, una segunda
-        # ejecución externa de 06 (tras RETRY/HALT_STAGE) sobrescribía en
-        # silencio los .txt/_validation.json/_rag_trace.json del intento
-        # externo anterior, en el MISMO directorio -- perdiendo toda
-        # trazabilidad histórica de por qué falló un intento previo.
-        #
-        # CONTRATO EXPLÍCITO del artefacto (no cambia silenciosamente):
-        #   - ArtifactReference["raw_section_outputs"] SIEMPRE apunta al
-        #     directorio PADRE (out / "raw_section_outputs") -- el
-        #     histórico COMPLETO de todos los intentos externos
-        #     preservados (agent_attempt_01/, agent_attempt_02/, ...).
-        #     Nunca a un subdirectorio de un intento en particular.
-        #   - raw_dir (esta variable) es el subdirectorio de ESTE intento
-        #     externo únicamente -- se usa para ESCRIBIR los archivos de
-        #     esta ejecución, nunca se registra como el ArtifactReference
-        #     en sí. Cuando el reporte/manifest necesita señalar dónde
-        #     quedaron los archivos de ESTE intento específico, usa la
-        #     clave "current_raw_attempt_directory" (metadata, no un
-        #     ArtifactReference nuevo).
-        # Nunca leída directamente por 07/08 ni por ningún otro consumidor
-        # del pipeline (confirmado: ningún módulo fuera de este archivo y
-        # artifacts.py referencia raw_section_outputs).
         raw_dir = out / "raw_section_outputs" / f"agent_attempt_{agent_input.attempt_number:02d}"
         raw_dir.mkdir(parents=True, exist_ok=True)
 
@@ -793,14 +720,6 @@ class DraftWritingAgent:
             policy["section_budgets"] = self._section_budgets(
                 sections, policy, strategy
             )
-
-            # Validación fail-closed del contrato de representación de
-            # secciones: una sola vez, ANTES de procesar cualquier
-            # sección -- incluidas las organizativas/source-free, que
-            # antes podían generarse (generated.append(...); continue)
-            # sin haber pasado por esta validación. Un flag desconocido
-            # ahora falla antes de tocar la primera sección, sin
-            # importar su tipo.
             contract = policy.get(
                 "draft_representation_contract",
                 LEGACY_DRAFT_REPRESENTATION_CONTRACT,
@@ -859,16 +778,6 @@ class DraftWritingAgent:
                     generated.append(generated_section)
                     continue
 
-                # Bifurcación mínima, un solo punto: el contrato ya fue
-                # validado UNA VEZ antes del bucle (ver arriba) --
-                # aquí solo se lee la variable ya calculada, nunca se
-                # revalida por sección. El código legacy de abajo sigue
-                # EXACTAMENTE igual, sin ninguna línea movida. Solo
-                # cuando la policy selecciona V2 explícitamente se
-                # invoca el módulo nuevo (import local: sin efectos
-                # secundarios al cargar draft_writing_agent.py, y sin
-                # ejecutar ninguna línea de canonical_sentences.py
-                # durante una corrida legacy).
                 if contract == CANONICAL_SENTENCES_DRAFT_REPRESENTATION_CONTRACT:
                     from src.tools.draft_writing.canonical_sentences import (
                         generate_section_canonical_v2,
@@ -885,25 +794,12 @@ class DraftWritingAgent:
                         sid=sid,
                         runtime_invoke_sequence_base=llm_calls,
                     )
-                    # Metadata de ejecución de V2 (nunca inferida de
-                    # archivos, nunca duplicando contadores por
-                    # separado): actualiza los contadores GLOBALES de
-                    # Agent06 con lo que V2 realmente ejecutó, y se
-                    # elimina antes de publicar la sección -- no forma
-                    # parte del contrato externo que consumen 07/08.
                     v2_execution = generated_section.pop("_v2_execution")
                     llm_calls += v2_execution["llm_calls"]
                     validation_calls += v2_execution["validation_calls"]
                     attempt_logs[sid] = v2_execution["attempt_logs"]
 
                     if v2_execution["failed"]:
-                        # Agotamiento de intentos V2: NUNCA fallback a
-                        # legacy, NUNCA execution_status=FAILED vía
-                        # excepción -- mismo contrato externo que ya
-                        # usa legacy (COMPLETED + NEEDS_REVISION +
-                        # RETRY/HALT_STAGE según intento externo), vía
-                        # la función auxiliar nueva (nunca toca el
-                        # bloque legacy existente).
                         return self._build_v2_section_validation_failed_result(
                             agent_input=agent_input,
                             sid=sid,
@@ -930,28 +826,6 @@ class DraftWritingAgent:
                 for generation_attempt in range(
                     1, int(policy["max_section_revision_attempts"]) + 2
                 ):
-                    # Instrumentación determinista de auditoría de retry
-                    # (sin exponer prompts/respuestas completas -- solo
-                    # SHA256 + metadatos): permite demostrar, con
-                    # evidencia directa en el propio validation.json ya
-                    # persistido, si el prompt cambió realmente entre
-                    # intentos y si previous_errors llegó a construirlo
-                    # -- nunca asume un bug solo porque dos raws
-                    # coincidan; lo confirma o lo descarta con datos.
-                    #
-                    # Alcance epistemológico explícito: esta
-                    # instrumentación prueba que self.runtime.invoke()
-                    # se EJECUTÓ como una llamada Python real dentro de
-                    # este bucle, con un prompt determinado (hash
-                    # verificable) -- NUNCA prueba, ni pretende probar,
-                    # qué hace el runtime/cliente/proveedor por dentro
-                    # (si hay caché HTTP, reuse de conexión, o
-                    # deduplicación en una capa inferior). El runtime es
-                    # una interfaz inyectada (DraftWritingRuntime.invoke
-                    # delega en invoke_fn, provisto externamente) --
-                    # deliberadamente desacoplada de cualquier proveedor
-                    # concreto; esta auditoría no asume ni depende de la
-                    # implementación de ningún proveedor específico.
                     previous_errors_codes_for_this_attempt = list(previous_errors)
                     prompt = build_section_prompt(
                         section,
@@ -966,26 +840,9 @@ class DraftWritingAgent:
                     runtime_invoke_sequence_before = llm_calls
                     raw = self.runtime.invoke(prompt)
                     llm_calls += 1
-                    # Mismo texto exacto que write_raw_section_output
-                    # persiste en el .txt real (str(raw) completo, no
-                    # solo .content) -- así este hash es directamente
-                    # comparable con un `sha256sum` externo sobre el
-                    # archivo .txt ya persistido.
                     raw_response_sha256 = hashlib.sha256(
                         str(raw).encode("utf-8")
                     ).hexdigest()
-                    # Metadata OPCIONAL y genérica: solo se registra si
-                    # el objeto devuelto por el runtime YA la expone por
-                    # sí mismo (ej. un identificador de respuesta o un
-                    # indicador de cache/reuse que el propio runtime/
-                    # cliente decidió incluir) -- nunca se infiere, nunca
-                    # se asume presente, y no depende de la forma
-                    # concreta de ningún proveedor (se leen únicamente
-                    # atributos que, de existir, ya son parte de la
-                    # respuesta tal como la entrega el runtime inyectado
-                    # externamente). Un dict vacío significa,
-                    # honestamente, que el runtime no expuso ninguna
-                    # metadata verificable -- no que no exista.
                     runtime_response_metadata: dict[str, Any] = {}
                     response_id = getattr(raw, "id", None)
                     if isinstance(response_id, str) and response_id:
@@ -1030,20 +887,7 @@ class DraftWritingAgent:
                     claim_errors = list(validation.get("claim_errors") or [])
                     numeric_errors = list(validation.get("numeric_errors") or [])
 
-                    # Detección determinista y puramente diagnóstica
-                    # (nunca repara ni acepta nada por sí misma -- ver
-                    # detect_claims_missing_leading_discourse_connector):
-                    # identifica cuándo la causa PRECISA de un claim/
-                    # oración desalineados es que el LLM omitió
-                    # únicamente el conector discursivo inicial. Se
-                    # ejecuta sobre "parsed" (el JSON crudo del LLM,
-                    # antes de normalización) para ver la oración CON su
-                    # conector y el claim SIN él, tal como el LLM los
-                    # escribió. El resultado se agrega a claim_errors
-                    # como feedback ESPECÍFICO y accionable para el
-                    # siguiente intento -- nunca cambia validation_ok,
-                    # nunca hereda/inventa una cita, nunca modifica el
-                    # matcher exacto ni el claim generado.
+                    
                     for finding in detect_claims_missing_leading_discourse_connector(parsed):
                         claim_errors.append(
                             "CLAIM_MISSING_INITIAL_DISCOURSE_CONNECTOR: "
@@ -1074,21 +918,7 @@ class DraftWritingAgent:
                         "generation_attempt": generation_attempt,
                         "validation_ok": bool(validation.get("validation_ok")),
                         "validation_errors": validation_errors,
-                        # Instrumentación de auditoría de retry -- ver
-                        # comentario junto a la construcción del prompt.
-                        # Permite confirmar CON EVIDENCIA, leyendo
-                        # directamente este archivo persistido, si el
-                        # prompt cambió entre intentos y si previous_
-                        # errors llegó a construirlo. runtime_invoke_
-                        # executed/sequence_number prueban que self.
-                        # runtime.invoke() se ejecutó como una llamada
-                        # real dentro de este bucle -- NO prueban, por sí
-                        # solos, ausencia de caché/reuse en capas
-                        # inferiores del runtime/cliente/proveedor;
-                        # runtime_response_metadata (opcional, ver
-                        # arriba) es lo único que aportaría esa
-                        # evidencia adicional, y solo si el runtime la
-                        # expone.
+                       
                         "retry_audit": {
                             "previous_errors_codes_used_in_prompt": previous_errors_codes_for_this_attempt,
                             "prompt_sha256": prompt_sha256,
@@ -1197,18 +1027,6 @@ class DraftWritingAgent:
                         accepted = normalized
                         break
 
-                    # Salvage numérico INMEDIATO sobre ESTE mismo intento
-                    # (nunca esperando a que se agoten todos los intentos
-                    # internos -- ver _try_immediate_numeric_salvage para
-                    # el criterio fail-closed heredado sin cambios). Si
-                    # un intento intermedio falla EXCLUSIVAMENTE por
-                    # UNSUPPORTED_NUMERIC_VALUE:*, se intenta reparar
-                    # determinísticamente aquí mismo, sin consumir un
-                    # intento LLM adicional -- antes, este intento se
-                    # perdía silenciosamente si el SIGUIENTE intento LLM
-                    # volvía a fallar por errores mixtos, porque el
-                    # salvage solo se probaba una vez, al final, sobre el
-                    # ÚLTIMO intento (logs[-1]).
                     (
                         salvaged_accepted,
                         salvage_log_entry,
@@ -1257,11 +1075,7 @@ class DraftWritingAgent:
                         + list(last_validation.get("claim_errors") or [])
                         + list(last_validation.get("numeric_errors") or []),
                         "generation_attempts": attempt_logs,
-                        # Contrato explícito (ver docstring de execute()):
-                        # current_raw_attempt_directory es el subdirectorio
-                        # de ESTE intento externo únicamente -- distinto
-                        # del ArtifactReference "raw_section_outputs" (el
-                        # directorio padre, histórico completo).
+                        
                         "current_raw_attempt_directory": str(raw_dir),
                         "published_draft": False,
                     }
@@ -1389,11 +1203,6 @@ class DraftWritingAgent:
                         validation = repaired_validation
                         length_repair_successful = True
                     else:
-                        # La reparación se intentó pero no cerró el
-                        # déficit/exceso con evidencia real disponible --
-                        # se conserva la validación ORIGINAL (nunca una
-                        # mezcla parcial) para que el reason_code y las
-                        # métricas de auditoría reflejen el estado real.
                         validation = repaired_validation
             validation["length_repair_attempted"] = length_repair_attempted
             validation["length_repair_successful"] = length_repair_successful
@@ -1410,11 +1219,6 @@ class DraftWritingAgent:
                 }
                 is_final_attempt = agent_input.attempt_number != 1
 
-                # Reason code específico de longitud -- nunca el genérico
-                # INVALID_DRAFT para estos casos. Si ya se intentó reparar
-                # sin éxito (evidencia insuficiente para el mínimo), se
-                # distingue explícitamente de un simple déficit no
-                # reparado todavía.
                 if validation.get("word_count_compliant", True) is False and validation.get("all_section_validations_ok", False) and validation.get("invalid_citation_count", 1) == 0 and not validation.get("sections_without_valid_citations", True) and not validation.get("sections_with_low_citation_density", True) and not validation.get("sections_with_claim_support_errors", True) and not validation.get("sections_with_quantitative_support_errors", True) and validation.get("numeric_failure_count", 1) == 0:
                     if validation.get("word_deficit", 0) > 0:
                         length_reason_code = (
@@ -1425,14 +1229,6 @@ class DraftWritingAgent:
                     else:
                         length_reason_code = TOTAL_WORD_COUNT_ABOVE_MAXIMUM
 
-                    # Intento final agotado con problema EXCLUSIVAMENTE de
-                    # longitud: fail-closed CIENTÍFICO, nunca técnico --
-                    # APPROVED_PENDING_MANUAL_REVIEW, nunca usable_for_
-                    # evaluation (ese campo no existe en el contrato de
-                    # Agent06; la evaluación parcial solo es válida
-                    # después de Agent07) y nunca ADVANCE hacia 08 -- el
-                    # target_stage permanece None, igual que el camino
-                    # histórico.
                     if is_final_attempt:
                         return AgentResult(
                             execution_status=ExecutionStatus.COMPLETED,
@@ -1643,19 +1439,11 @@ class DraftWritingAgent:
                     "retrieval_rounds": retrieval_rounds,
                 },
                 "versions": manifest_versions,
-                # Mismo contrato que en los caminos de fallo (ver
-                # docstring de raw_dir más arriba): el subdirectorio de
-                # ESTE intento externo, dentro del histórico completo que
-                # representa el ArtifactReference "raw_section_outputs".
+               
                 "current_raw_attempt_directory": str(raw_dir),
             }
             if contract == CANONICAL_SENTENCES_DRAFT_REPRESENTATION_CONTRACT:
-                # ÚNICAMENTE V2 declara esta clave -- legacy (ausente o
-                # "legacy" explícito) mantiene el manifest histórico
-                # sin campo nuevo, byte a byte, tal como garantiza
-                # LEGACY05/LEGACY07b (fase 1). Mismo criterio que
-                # _draft_signature (draft_writing_runtime.py): la clave
-                # solo existe cuando el contrato realmente es V2.
+    
                 manifest["draft_representation_contract"] = contract
             artifacts = write_draft_artifacts(
                 out,
