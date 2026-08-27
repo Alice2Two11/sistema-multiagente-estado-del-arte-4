@@ -1,3 +1,13 @@
+# ============================================================
+# 06 - AGENTE REDACTOR DEL ESTADO DEL ARTE
+# Recupera evidencia, redacta las secciones y valida el borrador
+# antes de enviarlo al agente verificador.
+# ============================================================
+
+#canonical_sentences_v2 organiza el borrador a nivel de oraciones 
+#para que luego sea más fácil verificar, rastrear y corregir afirmaciones 
+#concretas.
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -43,8 +53,8 @@ from src.tools.draft_writing.validation import (
 from src.tools.draft_writing.length_repair import attempt_directed_length_repair
 
 
-# Define la estrategia de recuperación usada por el agente 06
-# y el formato canónico con el que se representa el borrador.
+# Define la estrategia de recuperación (cómo busca el agente 06 la evidencia que va a usar para redactar cada sección)
+# y el formato canónico con el que se representa el borrador (cómo se representa internamente el borrador para que todas las partes del sistema lo entiendan)
 LEGACY_RETRIEVAL_STRATEGY = "legacy_chroma_then_csv_restricted"
 CANONICAL_SENTENCES_DRAFT_REPRESENTATION_CONTRACT = "canonical_sentences_v2"
 
@@ -67,8 +77,8 @@ class DraftWritingAgent:
     def __init__(self, runtime):
         self.runtime = runtime
 
-    # Obtiene la lista de papers asignados a una sección,
-    # evitando valores inválidos y fuentes duplicadas.
+    # limpia la lista de papers de una sección y devuelve
+    # las fuentes válidas y únicas que el agente 06 puede usar.
     @staticmethod
     def _section_sources(section: Mapping[str, Any]) -> list[str]:
         sources: list[str] = []
@@ -91,8 +101,8 @@ class DraftWritingAgent:
             if str(row["source_filename"]).strip() and str(row["chunk_id"]).strip()
         }
 
-    # Obtiene el contexto cuantitativo de una sección usando únicamente
-    # los papers asignados a esa sección y limita la cantidad de registros.
+    # prepara los datos numéricos y de datasets que el redactor puede usar en una sección, 
+    # pero únicamente de los papers asignados a esa sección y sin traer demasiados registros.
     def _quant_context(
         self,
         section: Mapping[str, Any],
@@ -121,8 +131,8 @@ class DraftWritingAgent:
             "dataset_technique_summary": dataset_rows,
         }
 
-    # Lee la estrategia de recuperación configurada y verifica
-    # que sea exactamente la estrategia legacy permitida por el agente 06.
+    # Lee qué estrategia de búsqueda de evidencia está configurada
+    # y comprueba que sea la única estrategia permitida por el agente 06.
     @staticmethod
     def _strategy(policy: Mapping[str, Any]) -> str:
         strategy = policy.get("retrieval_strategy")
@@ -153,15 +163,15 @@ class DraftWritingAgent:
         target_total_words = int(policy["target_total_words"])
         return assign_section_budgets(sections, target_total_words)
 
-    # Prepara la recuperación de evidencia para una sección
-    # usando los chunks disponibles del corpus.
+   c# Prepara la búsqueda de evidencia para una sección
+    # usando los fragmentos disponibles de los papers.
     def _retrieve_section_evidence(
         self,
-        section: Mapping[str, Any],
-        bundle: Mapping[str, Any],
-        policy: Mapping[str, Any],
-        strategy: str,
-        quantitative_context: Mapping[str, Any],
+        section: Mapping[str, Any], #la sección que se va a redactar
+        bundle: Mapping[str, Any], #contiene los datos disponibles del proyecto
+        policy: Mapping[str, Any], #trae las reglas de recuperación configuradas
+        strategy: str, #indica qué estrategia de búsqueda se debe usar
+        quantitative_context: Mapping[str, Any], #parte de la información cuantitativa del 03B que corresponde específicamente a la sección que el 06 está redactando
     ) -> list[dict[str, Any]]:
         chunks = bundle["chunks"]
 
@@ -178,8 +188,8 @@ class DraftWritingAgent:
             max_chars,
         )
 
-    # Construye el resultado de error cuando una sección
-    # no logra pasar la validación después de los intentos permitidos.
+    # devuelve el resultado oficial del agente indicando que esa sección falló la validación, 
+    # junto con toda la información necesaria para saber qué pasó y por qué.
     @staticmethod
     def _build_v2_section_validation_failed_result(
         *,
@@ -332,7 +342,6 @@ class DraftWritingAgent:
                     for name in NAMES
                     if (out / name).exists()
                 }
-               
                 artifacts["raw_section_outputs"] = ArtifactReference(
                     str(out / "raw_section_outputs"), "DIRECTORY"
                 )
@@ -386,8 +395,8 @@ class DraftWritingAgent:
             all_evidence: list[dict[str, Any]] = []
             attempt_logs: dict[str, list[dict[str, Any]]] = {}
 
-            #para cada sección, Stage06 prepara qué buscar, recupera la evidencia 
-            #correspondiente y la va acumulando para usarla después en la redacción.
+            # Recorre cada sección, busca la evidencia que le corresponde
+            # y la guarda para usarla después al redactar.
             for section in sections:
                 sid = str(section.get("section_id", "")).strip()
                 section_query = build_section_query(section)
@@ -407,7 +416,7 @@ class DraftWritingAgent:
                     retrieval_rounds += 1
                 all_evidence.extend({"section_id": sid, **row} for row in evidence)
 
-                ## Si no hay evidencia, revisa mediante section_allows_no_sources()
+                # Si no hay evidencia, revisa mediante section_allows_no_sources() -> introducción, conclusiones
                 # si esa sección está autorizada para redactarse sin fuentes.
                 if not evidence:
                     if not section_allows_no_sources(section):
@@ -469,18 +478,19 @@ class DraftWritingAgent:
                     generated.append(generated_section)
                     continue
 
+            # Organiza la evidencia por sección y valida el borrador completo.
             evidence_map: dict[str, list[dict[str, Any]]] = {}
             for row in all_evidence:
                 evidence_map.setdefault(row["section_id"], []).append(
                     {key: value for key, value in row.items() if key != "section_id"}
                 )
             _, quality_rows, section_rows, claim_rows, numeric_rows = (
-                build_draft_reports(generated, sections, evidence_map, policy)
+                build_draft_reports(generated, sections, evidence_map, policy) #genera reportes sobre calidad, secciones, claims y datos numéricos
             )
-            validation = validate_draft_global(
+            validation = validate_draft_global( #revisa si el borrador completo cumple las reglas de 
                 generated, sections, evidence_map, policy
             )
-            validation.update(
+            validation.update( # revisa si el borrador cumple las reglas de longitud, evidencia, citas y estructura.
                 {
                     "stage": "06_agente_redactor",
                     "experiment_id": agent_input.experiment_id,
@@ -491,9 +501,11 @@ class DraftWritingAgent:
             )
             validation_calls += 1
 
+            # Comprueba si el único problema del borrador es que no cumple
+            # con la longitud requerida.
             length_repair_attempted = False
             length_repair_successful = False
-            length_only_failure = (
+            length_only_failure = ( #¿todo está bien excepto la cantidad de palabras?
                 not validation["validation_ok"]
                 and validation.get("word_count_compliant", True) is False
                 and validation.get("all_section_validations_ok", False)
@@ -504,16 +516,18 @@ class DraftWritingAgent:
                 and not validation.get("sections_with_quantitative_support_errors", True)
                 and validation.get("numeric_failure_count", 1) == 0
             )
+            # Si el único problema es la longitud y el borrador usa el formato canónico,
+            # intenta ajustar el texto y vuelve a validarlo.
             if length_only_failure and contract == CANONICAL_SENTENCES_DRAFT_REPRESENTATION_CONTRACT:
                 length_repair_attempted = True
-                repaired_generated, repair_meta = attempt_directed_length_repair(
+                repaired_generated, repair_meta = attempt_directed_length_repair( #intenta ajustar la longitud con attempt_directed_length_repair(...)
                     generated, sections, evidence_map, policy, self.runtime,
                 )
                 if repair_meta["attempted"]:
                     _, quality_rows, section_rows, claim_rows, numeric_rows = (
                         build_draft_reports(repaired_generated, sections, evidence_map, policy)
                     )
-                    repaired_validation = validate_draft_global(
+                    repaired_validation = validate_draft_global( #Si realmente hizo una reparación, vuelve a generar los reportes y vuelve a validar todo el borrador.
                         repaired_generated, sections, evidence_map, policy
                     )
                     if repaired_validation["validation_ok"]:
@@ -525,6 +539,8 @@ class DraftWritingAgent:
             validation["length_repair_attempted"] = length_repair_attempted
             validation["length_repair_successful"] = length_repair_successful
 
+            # Si el borrador no pasa la validación, guarda el reporte parcial
+            # y prepara los artefactos necesarios para registrar el fallo.
             if not validation["validation_ok"]:
                 path = write_partial_validation(out, validation)
                 artifacts = {
@@ -537,7 +553,18 @@ class DraftWritingAgent:
                 }
                 is_final_attempt = agent_input.attempt_number != 1
 
-                if validation.get("word_count_compliant", True) is False and validation.get("all_section_validations_ok", False) and validation.get("invalid_citation_count", 1) == 0 and not validation.get("sections_without_valid_citations", True) and not validation.get("sections_with_low_citation_density", True) and not validation.get("sections_with_claim_support_errors", True) and not validation.get("sections_with_quantitative_support_errors", True) and validation.get("numeric_failure_count", 1) == 0:
+                # Si el único problema del borrador es la longitud,
+                # determina si quedó demasiado corto o demasiado largo.
+                if (
+                    validation.get("word_count_compliant", True) is False
+                    and validation.get("all_section_validations_ok", False)
+                    and validation.get("invalid_citation_count", 1) == 0
+                    and not validation.get("sections_without_valid_citations", True)
+                    and not validation.get("sections_with_low_citation_density", True)
+                    and not validation.get("sections_with_claim_support_errors", True)
+                    and not validation.get("sections_with_quantitative_support_errors", True)
+                    and validation.get("numeric_failure_count", 1) == 0
+                ):
                     if validation.get("word_deficit", 0) > 0:
                         length_reason_code = (
                             INSUFFICIENT_SUPPORTED_CONTENT_FOR_MIN_LENGTH
@@ -547,6 +574,8 @@ class DraftWritingAgent:
                     else:
                         length_reason_code = TOTAL_WORD_COUNT_ABOVE_MAXIMUM
 
+                    # Si ya es el último intento y el único problema sigue siendo la longitud,
+                    # detiene Stage06 y manda el borrador a revisión manual.
                     if is_final_attempt:
                         return AgentResult(
                             execution_status=ExecutionStatus.COMPLETED,
@@ -559,7 +588,7 @@ class DraftWritingAgent:
                                     "continuar. No se publican salidas finales desde Agent06."
                                 ),
                             ),
-                            quality_metrics={
+                            quality_metrics={ #guarda cuántas palabras debía tener, cuántas tiene y si se intentó reparar.
                                 "scientific": {
                                     "configured_min_total_words": validation["configured_min_total_words"],
                                     "configured_max_total_words": validation["configured_max_total_words"],
@@ -576,7 +605,7 @@ class DraftWritingAgent:
                                     "length_repair_successful": length_repair_successful,
                                 },
                             },
-                            warnings=(
+                            warnings=( #genera una advertencia bloqueante con el motivo exacto.
                                 AgentWarning(
                                     code=length_reason_code,
                                     severity=WarningSeverity.WARNING,
@@ -607,6 +636,8 @@ class DraftWritingAgent:
                             completed_at=datetime.now(timezone.utc).isoformat(),
                         )
 
+                    # Si la validación global falla pero todavía se puede reintentar,
+                    # devuelve el resultado indicando que el borrador necesita revisión.
                     return AgentResult(
                         execution_status=ExecutionStatus.COMPLETED,
                         quality_status=QualityStatus.NEEDS_REVISION,
@@ -660,6 +691,8 @@ class DraftWritingAgent:
                         completed_at=datetime.now(timezone.utc).isoformat(),
                     )
 
+                # Decide si Stage06 debe reintentarse o detenerse según
+                # si todavía queda otro intento disponible.
                 action = (
                     TransitionAction.RETRY
                     if agent_input.is_first_attempt()
@@ -705,6 +738,8 @@ class DraftWritingAgent:
                     completed_at=datetime.now(timezone.utc).isoformat(),
                 )
 
+            # Construye el borrador final de Stage06 con sus secciones
+            # y guarda un resumen de cómo fue generado.
             draft = {
                 "title": bundle["outline"].get(
                     "title", "Borrador del estado del arte"
@@ -722,14 +757,14 @@ class DraftWritingAgent:
                     **versions,
                 },
             }
-            manifest_versions = {
+            manifest_versions = { # Guarda las versiones de los componentes usados para generar el borrador.
                 "stage": versions["stage_version"],
                 "prompt": policy.get("prompt_version"),
                 "rag": versions["rag_version"],
                 "validation": versions["validation_version"],
                 "normalization": versions["normalization_version"],
             }
-            manifest = {
+            manifest = { # Guarda los datos principales de la ejecución y las reglas de seguridad usadas.
                 "stage": agent_input.stage_name,
                 "experiment_id": agent_input.experiment_id,
                 "run_id": agent_input.run_id,
@@ -750,6 +785,8 @@ class DraftWritingAgent:
                 "versions": manifest_versions,
                 "current_raw_attempt_directory": str(raw_dir),
             }
+            # Guarda en el manifest el formato del borrador cuando usa el contrato canónico
+            # y luego escribe todos los archivos finales generados por Stage06.
             if contract == CANONICAL_SENTENCES_DRAFT_REPRESENTATION_CONTRACT:
                 manifest["draft_representation_contract"] = contract
             artifacts = write_draft_artifacts(
@@ -765,6 +802,8 @@ class DraftWritingAgent:
                 claim_rows,
                 numeric_rows,
             )
+            # Devuelve el resultado final cuando el borrador pasó la validación
+            # y autoriza avanzar al agente verificador.
             return AgentResult(
                 execution_status=ExecutionStatus.COMPLETED,
                 quality_status=QualityStatus.APPROVED,
@@ -775,8 +814,8 @@ class DraftWritingAgent:
                         "evidencia restringida."
                     ),
                 ),
-                quality_metrics={
-                    "scientific": {
+                quality_metrics={ #guarda las métricas de longitud y si hubo reparación
+                    "scientific": { 
                         "configured_min_total_words": validation.get("configured_min_total_words"),
                         "configured_max_total_words": validation.get("configured_max_total_words"),
                         "target_total_words": validation.get("target_total_words"),
@@ -796,7 +835,7 @@ class DraftWritingAgent:
                 failure_reason_codes=(),
                 requested_transition=RequestedTransition(
                     action=TransitionAction.ADVANCE,
-                    target_stage="07_agente_verificador",
+                    target_stage="07_agente_verificador", #el siguiente paso es Stage07
                     reason_code="APPROVED",
                     requires_human_confirmation=False,
                 ),
@@ -810,6 +849,8 @@ class DraftWritingAgent:
                 started_at=start,
                 completed_at=datetime.now(timezone.utc).isoformat(),
             )
+        # Si ocurre un error, identifica si corresponde a un problema conocido
+        # y asigna un código específico; si no, usa un error general.
         except Exception as exc:
             message = str(exc)
             known = (
@@ -845,6 +886,8 @@ class DraftWritingAgent:
                 "UNSUPPORTED_DRAFT_RETRIEVAL_STRATEGY",
             )
             code = next((item for item in known if item in message), "RUNTIME_DEPENDENCY_FAILED")
+            # Si ocurre un fallo definitivo en Stage06, devuelve un resultado de error,
+            # registra la causa y detiene la etapa.
             return AgentResult(
                 execution_status=ExecutionStatus.FAILED,
                 quality_status=QualityStatus.REJECTED,
