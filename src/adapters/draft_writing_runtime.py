@@ -3,19 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-import re
 from typing import Any, Mapping
 
 from src.agents.draft_writing_agent import (
     CANONICAL_SENTENCES_DRAFT_REPRESENTATION_CONTRACT,
-    HYBRID_VERSIONS as HYBRID_RUNTIME_VERSIONS,
-    LEGACY_DRAFT_REPRESENTATION_CONTRACT,
     LEGACY_VERSIONS as LEGACY_RUNTIME_VERSIONS,
     DraftWritingAgent,
 )
 from src.config.draft_writing_policy_config import (
     LEGACY_RETRIEVAL_STRATEGY,
-    PLANNED_HYBRID_RETRIEVAL_STRATEGY,
     get_draft_writing_policy,
 )
 from src.contracts.agent_input import (
@@ -25,33 +21,26 @@ from src.contracts.agent_input import (
     ExecutionMode,
     PreviousAttemptSummary,
 )
-from src.contracts.agent_result import AgentResult, QualityStatus
-from src.runtime.draft_writing_protocol import build_draft_fingerprints
 from src.state.fingerprints import fingerprint_mapping, sha256_file
 from src.utils.json_parsing import parse_json_safely
 
 
-# LEGACY_RUNTIME_VERSIONS / HYBRID_RUNTIME_VERSIONS: fuente
-# canonica unica en src/agents/draft_writing_agent.py (LEGACY_
-# VERSIONS / HYBRID_VERSIONS), importada arriba con alias -- ver
-# ese modulo para los valores y su documentacion completa. Antes
-# de esta unificacion, este archivo definia su propia copia
-# identica (duplicacion documentada como deuda preexistente); ahora
-# agent y runtime consumen exactamente el mismo objeto dict.
-REQUIRED_DRAFT_ARTIFACTS = (
-    "state_of_art_draft.json",
-    "state_of_art_draft.md",
-    "draft_sections.csv",
-    "draft_rag_evidence.csv",
-    "draft_quality_check.csv",
-    "draft_length_check.csv",
-    "draft_claim_evidence.csv",
-    "numeric_hallucination_check.csv",
-    "draft_validation_report.json",
-    "quantitative_comparative_table_used.csv",
-    "dataset_technique_summary_used.csv",
-    "draft_generation_manifest.json",
-)
+# LEGACY_RUNTIME_VERSIONS: fuente canonica unica en
+# src/agents/draft_writing_agent.py (LEGACY_VERSIONS), importada
+# arriba con alias -- ver ese modulo para los valores y su
+# documentacion completa. Antes de esta unificacion, este archivo
+# definia su propia copia identica (duplicacion documentada como
+# deuda preexistente); ahora agent y runtime consumen exactamente
+# el mismo objeto dict.
+#
+# STAGE06-FINAL-CLEANUP: REQUIRED_DRAFT_ARTIFACTS fue eliminada -- sus
+# 3 únicos consumidores vivían en el subgrafo PREPARE/COMMIT/RESUME
+# (prepare_draft_execution/execute_prepared_draft/commit_executed_draft/
+# resume_draft_execution), también eliminado por completo: el flujo real
+# de Stage06 usa exclusivamente pipeline_orchestrator.py::
+# _draft_runtime_transaction -> src/runtime/draft_writing_protocol.py
+# (execute_draft_transaction/resolve_draft_resume), confirmado sin
+# ningún consumidor de este archivo para esa transacción.
 
 
 @dataclass
@@ -128,24 +117,23 @@ def build_openai_draft_runtime(
 
 
 def _runtime_versions(strategy: str) -> dict[str, str]:
-    if strategy == PLANNED_HYBRID_RETRIEVAL_STRATEGY:
-        return dict(HYBRID_RUNTIME_VERSIONS)
-    if strategy == LEGACY_RETRIEVAL_STRATEGY:
-        return dict(LEGACY_RUNTIME_VERSIONS)
-    raise ValueError(f"UNSUPPORTED_DRAFT_RETRIEVAL_STRATEGY:{strategy}")
+    # Única ruta productiva confirmada empíricamente en las 10 corridas
+    # experimentales reales -- fail-closed, sin fallback silencioso.
+    if strategy != LEGACY_RETRIEVAL_STRATEGY:
+        raise ValueError(f"UNSUPPORTED_DRAFT_RETRIEVAL_STRATEGY:{strategy!r}")
+    return dict(LEGACY_RUNTIME_VERSIONS)
 
 
 def build_runtime_draft_policy(
     overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build a coherent runtime policy while keeping the general default legacy."""
+    """Build the runtime policy for the single supported retrieval strategy."""
     requested = dict(overrides or {})
     policy = get_draft_writing_policy(requested)
     strategy = str(policy["retrieval_strategy"])
     policy.update(_runtime_versions(strategy))
-    if strategy == LEGACY_RETRIEVAL_STRATEGY:
-        policy.pop("quantitative_selection_version", None)
-        policy.pop("budget_version", None)
+    policy.pop("quantitative_selection_version", None)
+    policy.pop("budget_version", None)
     return policy
 
 
@@ -459,28 +447,14 @@ def _dependency_references(cfg) -> dict[str, ArtifactReference]:
 
 def _draft_signature(cfg, dependencies) -> dict[str, Any]:
     policy = {key: value for key, value in cfg["policy"].items() if key != "current_fingerprint"}
-    contract = policy.get(
-        "draft_representation_contract",
-        LEGACY_DRAFT_REPRESENTATION_CONTRACT,
-    )
-    if contract not in {
-        LEGACY_DRAFT_REPRESENTATION_CONTRACT,
-        CANONICAL_SENTENCES_DRAFT_REPRESENTATION_CONTRACT,
-    }:
-        # Misma semántica fail-closed que en draft_writing_agent.py: un
-        # valor desconocido nunca puede colapsar silenciosamente al
-        # fingerprint legacy -- se rechaza aquí también, antes de
-        # construir ninguna firma.
-        raise ValueError(f"UNKNOWN_DRAFT_REPRESENTATION_CONTRACT:{contract}")
+    # Única ruta productiva confirmada empíricamente en las 10 corridas
+    # experimentales reales: draft_representation_contract siempre
+    # canonical_sentences_v2. Ausencia o cualquier otro valor (incluido
+    # "legacy" explícito) falla fail-closed, antes de construir firma
+    # alguna -- sin fallback silencioso.
+    contract = policy.get("draft_representation_contract")
     if contract != CANONICAL_SENTENCES_DRAFT_REPRESENTATION_CONTRACT:
-        # Legacy (ausente o "legacy" explícito): la clave NUNCA
-        # participa en el fingerprint histórico -- se remueve
-        # explícitamente de la copia usada para la firma, sin importar
-        # si ya estaba presente en cfg["policy"]. Esto es lo único que
-        # garantiza fingerprint(legacy) == fingerprint(pre-cambio),
-        # byte a byte, incluso si "legacy" llega a aparecer explícito
-        # en una configuración real en el futuro.
-        policy = {key: value for key, value in policy.items() if key != "draft_representation_contract"}
+        raise ValueError(f"UNKNOWN_DRAFT_REPRESENTATION_CONTRACT:{contract!r}")
     signature = {
         "stage": "06_agente_redactor",
         "stage_version": policy["stage_version"],
@@ -499,11 +473,8 @@ def _draft_signature(cfg, dependencies) -> dict[str, Any]:
         "prompt_version": policy["prompt_version"],
         "rag_version": policy["rag_version"],
         "validation_version": policy["validation_version"],
+        "draft_representation_contract": CANONICAL_SENTENCES_DRAFT_REPRESENTATION_CONTRACT,
     }
-    if contract == CANONICAL_SENTENCES_DRAFT_REPRESENTATION_CONTRACT:
-        # ÚNICAMENTE V2 incorpora esta clave al fingerprint -- nunca
-        # legacy, ni por ausencia ni por valor explícito (ver arriba).
-        signature["draft_representation_contract"] = CANONICAL_SENTENCES_DRAFT_REPRESENTATION_CONTRACT
     return signature
 
 
@@ -579,229 +550,3 @@ def build_real_draft_execution(
     )
     return DraftWritingAgent(runtime), build_draft_agent_input(cfg), cfg
 
-
-@dataclass(frozen=True)
-class PreparedDraftExecution:
-    decision_id: str
-    agent_input: AgentInput
-
-
-@dataclass(frozen=True)
-class ExecutedDraftExecution:
-    decision_id: str
-    agent_input: AgentInput
-    result: AgentResult
-    persisted_result_path: str
-
-
-def prepare_draft_execution(*, store, agent_input: AgentInput) -> PreparedDraftExecution:
-    prepared = store.prepare_execution(
-        target_stage=agent_input.stage_name,
-        intended_action="EXECUTE_DRAFT_WRITING",
-        attempt_number=agent_input.attempt_number,
-    )
-    return PreparedDraftExecution(prepared.decision_id, agent_input)
-
-
-def execute_prepared_draft(
-    *,
-    store,
-    agent,
-    prepared: PreparedDraftExecution,
-) -> ExecutedDraftExecution:
-    result = agent.execute(prepared.agent_input)
-    path = store.persist_agent_result(prepared.decision_id, result)
-    return ExecutedDraftExecution(
-        prepared.decision_id,
-        prepared.agent_input,
-        result,
-        str(path),
-    )
-
-
-def _approved_result(result: AgentResult) -> bool:
-    return result.quality_status in {
-        QualityStatus.APPROVED,
-        QualityStatus.APPROVED_WITH_WARNINGS,
-        QualityStatus.APPROVED_AFTER_MANUAL_REVIEW,
-    }
-
-
-def _validate_complete_artifacts(result: AgentResult) -> None:
-    missing = [name for name in REQUIRED_DRAFT_ARTIFACTS if name not in result.output_artifacts]
-    if missing:
-        raise RuntimeError(f"DRAFT_COMMIT_INCOMPLETE_ARTIFACTS:{','.join(missing)}")
-
-
-def commit_executed_draft(*, store, executed: ExecutedDraftExecution, observations=None):
-    if not _approved_result(executed.result):
-        raise RuntimeError("DRAFT_COMMIT_REQUIRES_APPROVED_RESULT")
-    _validate_complete_artifacts(executed.result)
-    return store.commit_execution(
-        decision_id=executed.decision_id,
-        result=executed.result,
-        stage_name=executed.agent_input.stage_name,
-        fingerprints=build_draft_fingerprints(executed.agent_input),
-        observations=dict(observations or {}),
-    )
-
-
-def _manifest_versions_match(manifest: Mapping[str, Any], expected_versions: Mapping[str, str]) -> bool:
-    versions = manifest.get("versions", {})
-    if not isinstance(versions, Mapping):
-        return False
-    if (
-        versions.get("stage") != expected_versions["stage_version"]
-        or versions.get("rag") != expected_versions["rag_version"]
-        or versions.get("validation") != expected_versions["validation_version"]
-        # Un manifest producido ANTES de este contrato no tiene la clave
-        # "normalization" en absoluto (versions.get(...) da None) --
-        # nunca coincide con el string real esperado, invalidando
-        # correctamente cualquier resume/reuse sobre un draft generado
-        # con la normalización anterior (que podía vaciar draft_text).
-        or versions.get("normalization") != expected_versions["normalization_version"]
-    ):
-        return False
-    if "quantitative_selection_version" in expected_versions:
-        if "retrieval_strategy" not in manifest:
-            return True
-        return (
-            versions.get("quantitative_selection")
-            == expected_versions["quantitative_selection_version"]
-            and versions.get("budget") == expected_versions["budget_version"]
-        )
-    return "quantitative_selection" not in versions and "budget" not in versions
-
-
-def _is_sha256(value: str) -> bool:
-    return bool(re.fullmatch(r"[0-9a-fA-F]{64}", str(value or "")))
-
-
-def _validate_resume_candidate(
-    *,
-    result: AgentResult,
-    agent_input: AgentInput,
-    artifact_references: Mapping[str, ArtifactReference] | None = None,
-) -> None:
-    if not _approved_result(result):
-        raise RuntimeError("DRAFT_RESUME_REQUIRES_APPROVED_RESULT")
-
-    missing = [
-        name for name in REQUIRED_DRAFT_ARTIFACTS
-        if name not in result.output_artifacts
-    ]
-    if missing:
-        raise RuntimeError(
-            f"DRAFT_COMMIT_INCOMPLETE_ARTIFACTS:{','.join(missing)}"
-        )
-
-    committed_refs = dict(artifact_references or {})
-    for name in REQUIRED_DRAFT_ARTIFACTS:
-        reference = result.output_artifacts[name]
-        path = Path(reference.path)
-        if not path.is_file():
-            if name == "draft_generation_manifest.json":
-                raise RuntimeError("DRAFT_RESUME_MANIFEST_NOT_FOUND")
-            raise RuntimeError(f"DRAFT_COMMIT_INCOMPLETE_ARTIFACTS:{name}")
-        if committed_refs:
-            committed = committed_refs.get(name)
-            if committed is None:
-                raise RuntimeError(f"DRAFT_COMMIT_INCOMPLETE_ARTIFACTS:{name}")
-            if committed.path != reference.path or committed.hash != reference.hash:
-                raise RuntimeError(f"DRAFT_RESUME_ARTIFACT_REFERENCE_MISMATCH:{name}")
-        if _is_sha256(reference.hash) and sha256_file(path) != reference.hash:
-            raise RuntimeError(f"DRAFT_RESUME_ARTIFACT_HASH_MISMATCH:{name}")
-
-    manifest_path = Path(
-        result.output_artifacts["draft_generation_manifest.json"].path
-    )
-    if not manifest_path.is_file():
-        raise RuntimeError("DRAFT_RESUME_MANIFEST_NOT_FOUND")
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise RuntimeError("DRAFT_RESUME_MANIFEST_INVALID") from exc
-    if not isinstance(manifest, Mapping):
-        raise RuntimeError("DRAFT_RESUME_MANIFEST_INVALID")
-
-    strategy = str(agent_input.policy["retrieval_strategy"])
-    expected_versions = _runtime_versions(strategy)
-    expected_fingerprint = str(
-        agent_input.policy.get("current_fingerprint", "")
-    )
-
-    if "retrieval_strategy" in manifest:
-        if manifest.get("retrieval_strategy") != strategy:
-            raise RuntimeError("DRAFT_RESUME_VERSION_MISMATCH")
-        if not _manifest_versions_match(manifest, expected_versions):
-            raise RuntimeError("DRAFT_RESUME_VERSION_MISMATCH")
-        if (
-            not expected_fingerprint
-            or manifest.get("fingerprint") != expected_fingerprint
-        ):
-            raise RuntimeError("DRAFT_RESUME_FINGERPRINT_MISMATCH")
-        return
-
-    if not expected_fingerprint or manifest.get("fingerprint") != expected_fingerprint:
-        raise RuntimeError("DRAFT_RESUME_FINGERPRINT_MISMATCH")
-    if not _manifest_versions_match(manifest, expected_versions):
-        raise RuntimeError("DRAFT_RESUME_VERSION_MISMATCH")
-
-
-def _committed_result_from_state(state, stage_name: str) -> AgentResult:
-    for entry in reversed(state.decision_log):
-        if entry.stage != stage_name:
-            continue
-        try:
-            return AgentResult.from_dict(entry.result)
-        except Exception as exc:
-            raise RuntimeError("DRAFT_RESUME_RESULT_INVALID") from exc
-    raise RuntimeError("DRAFT_RESUME_RESULT_NOT_FOUND")
-
-
-def _committed_artifact_references(state) -> dict[str, ArtifactReference]:
-    return {
-        name: artifact_state.reference
-        for name, artifact_state in state.artifacts.items()
-    }
-
-
-def resume_draft_execution(*, store, agent_input: AgentInput, observations=None):
-    state = store.load()
-    pending = state.pending_execution
-
-    if pending is not None:
-        result = store.find_persisted_agent_result(pending.decision_id)
-        if result is None:
-            return store.resolve_resume(
-                stage_name=agent_input.stage_name,
-                fingerprints=build_draft_fingerprints(agent_input),
-                observations=dict(observations or {}),
-            )
-        try:
-            _validate_resume_candidate(
-                result=result,
-                agent_input=agent_input,
-            )
-        except Exception:
-            store.cancel_pending_execution()
-            raise
-        return store.resolve_resume(
-            stage_name=agent_input.stage_name,
-            fingerprints=build_draft_fingerprints(agent_input),
-            observations=dict(observations or {}),
-        )
-
-    result = _committed_result_from_state(state, agent_input.stage_name)
-    _validate_resume_candidate(
-        result=result,
-        agent_input=agent_input,
-        artifact_references=_committed_artifact_references(state),
-    )
-    from src.state.state_store import ResumeResolution
-
-    return ResumeResolution(
-        action="NO_PENDING",
-        state=state,
-        committed_result=result,
-    )

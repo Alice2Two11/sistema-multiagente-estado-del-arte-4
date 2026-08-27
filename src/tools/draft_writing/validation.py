@@ -1,9 +1,43 @@
 from __future__ import annotations
 import re
 from .retrieval import safe_str
-from .normalization import CITATION_RE, split_sentences_preserving_citations, is_substantive_sentence, normalize_claim_text
+from .normalization import CITATION_RE, split_sentences_preserving_citations, is_substantive_sentence
 from .prompting import assign_section_budgets
 from src.tools.shared.section_source_requirement import section_is_source_free_organizational
+
+
+def _canonical_numeric_tokens(text):
+    value = str(text or "")
+
+    # Normaliza decimal comma y espacios alrededor del %
+    value = value.replace(",", ".")
+
+    tokens = set()
+
+    # 42.9%, 42.9 %, 500, 0.001, etc.
+    for match in re.finditer(
+        r"(?<![\w.])[-+]?\d+(?:\.\d+)?\s*%?",
+        value,
+    ):
+        token = match.group(0).strip()
+        token = re.sub(r"\s+", "", token)
+
+        if token:
+            tokens.add(token)
+
+    # Formato invertido poco habitual: %42.9
+    for match in re.finditer(
+        r"%\s*[-+]?\d+(?:\.\d+)?",
+        value,
+    ):
+        token = match.group(0)
+        token = token.replace("%", "").strip()
+        token = re.sub(r"\s+", "", token)
+
+        if token:
+            tokens.add(token + "%")
+
+    return tokens
 
 
 def compute_unsupported_numeric_values(
@@ -51,21 +85,6 @@ def compute_unsupported_numeric_values(
     return errors
 
 
-def build_section_evidence_numeric_tokens(evidence):
-    """Función PURA y compartida: conjunto de tokens numéricos
-    canónicos presentes en CUALQUIER fila de evidencia de la sección
-    (no solo la citada por una oración específica) -- MISMA semántica
-    histórica exacta que ya construía ``validate_generated_section``
-    inline antes de esta extracción."""
-
-    tokens = set()
-    for row in evidence or []:
-        if not isinstance(row, dict):
-            continue
-        tokens.update(_canonical_numeric_tokens(row.get("text") or row.get("chunk_text") or ""))
-    return tokens
-
-
 def count_words(text):
     return len(re.findall(r"\b[\wáéíóúüñ]+\b", safe_str(text), flags=re.IGNORECASE))
 
@@ -100,72 +119,6 @@ def number_exists_in_text(value, text):
     return token in safe_str(text).replace(",", ".")
 
 
-def validate_generated_section(generated, section, evidence):
-    errors = []
-    citation_errors = []
-    claim_errors = []
-    numeric_errors = []
-    allowed = {(r["source_filename"], r["chunk_id"]): r.get("text", "") for r in evidence}
-    if not isinstance(generated, dict):
-        return {"validation_ok": False, "errors": ["section_output_not_object"], "citation_errors": [], "claim_errors": [], "numeric_errors": [], "valid_citation_count": 0, "substantive_sentence_count": 0}
-    if safe_str(generated.get("section_id")) != safe_str(section.get("section_id")):
-        errors.append("SECTION_ID_MISMATCH")
-    if not safe_str(generated.get("section_title")):
-        errors.append("MISSING_SECTION_TITLE")
-    text = safe_str(generated.get("draft_text"))
-    claims = generated.get("claims")
-    if not text:
-        errors.append("EMPTY_DRAFT_TEXT")
-    if not isinstance(claims, list):
-        errors.append("INVALID_CLAIMS")
-        claims = []
-    sentences = split_sentences_preserving_citations(text)
-    substantive = [s for s in sentences if is_substantive_sentence(s)]
-    claim_map = {}
-    for claim in claims:
-        if not isinstance(claim, dict):
-            claim_errors.append("claim_not_object")
-            continue
-        key = normalize_claim_text(claim.get("claim"))
-        if not key:
-            claim_errors.append("empty_claim")
-            continue
-        if key in claim_map:
-            claim_errors.append("duplicate_claim_text")
-        claim_map[key] = claim
-    for sentence in substantive:
-        pairs = [(a.strip(), b.strip()) for a, b in CITATION_RE.findall(sentence)]
-        if not pairs:
-            citation_errors.append("uncited_substantive_sentence")
-        for pair in pairs:
-            if pair not in allowed:
-                citation_errors.append("invalid_citation")
-        claim = claim_map.get(normalize_claim_text(sentence))
-        if not claim:
-            claim_errors.append("missing_claim_for_sentence")
-            continue
-        claim_pairs = []
-        for value in claim.get("supporting_citations") or []:
-            match = CITATION_RE.fullmatch(safe_str(value))
-            if match:
-                claim_pairs.append((match.group(1).strip(), match.group(2).strip()))
-        if set(claim_pairs) != set(pairs):
-            claim_errors.append("claim_citation_mismatch")
-        numeric_errors.extend(
-            compute_unsupported_numeric_values(normalize_claim_text(sentence), pairs, allowed, set())
-        )
-    all_errors = errors + citation_errors + claim_errors
-    return {
-        "validation_ok": not all_errors and not numeric_errors,
-        "errors": sorted(set(errors)),
-        "citation_errors": sorted(set(citation_errors)),
-        "claim_errors": sorted(set(claim_errors)),
-        "numeric_errors": sorted(set(numeric_errors)),
-        "valid_citation_count": sum(1 for s in sentences for pair in CITATION_RE.findall(s) if (pair[0].strip(), pair[1].strip()) in allowed),
-        "substantive_sentence_count": len(substantive),
-    }
-
-
 def section_allows_no_sources(section):
     """Reutiliza classify_section_source_requirement (``src/tools/
     shared/section_source_requirement.py``), la MISMA fuente que
@@ -191,8 +144,16 @@ def build_draft_reports(sections, outline_sections, evidence_map, policy):
         title = safe_str(section.get("section_title"))
         text = safe_str(section.get("draft_text"))
         evidence = evidence_map.get(sid, [])
-        outline = next((item for item in outline_sections if safe_str(item.get("section_id")) == sid), {"section_id": sid})
-        validation = section.get("section_validation") or validate_generated_section(section, outline, evidence)
+        # Fail-closed: los dos únicos productores de secciones
+        # (generate_section_canonical_v2 y build_source_free_
+        # organizational_section) SIEMPRE entregan section_validation en
+        # cada uno de sus returns -- confirmado exhaustivamente,
+        # auditoría STAGE06-FINAL-DEAD-CODE-AUDIT. Una sección sin esa
+        # clave es una inconsistencia real del pipeline, nunca se
+        # reconstruye en silencio con un validador histórico.
+        validation = section.get("section_validation")
+        if not validation:
+            raise ValueError(f"MISSING_SECTION_VALIDATION:{sid}")
         claims = section.get("claims") if isinstance(section.get("claims"), list) else []
         citation_pairs = [(a.strip(), b.strip()) for a, b in CITATION_RE.findall(text)]
         allowed_pairs = {(r["source_filename"], r["chunk_id"]) for r in evidence}
@@ -264,121 +225,3 @@ def validate_draft_global(sections, outline_sections=None, evidence_map=None, po
     report, _, _, _, _ = build_draft_reports(sections, outline_sections, evidence_map, policy)
     return report
 
-
-# --- NUMERIC_NORMALIZATION_FIX_V1 ---
-# Wrapper conservador sobre el validador original.
-# Solo elimina UNSUPPORTED_NUMERIC_VALUE cuando el mismo valor
-# aparece realmente en la evidencia entregada a 06.
-
-_validate_generated_section_original = validate_generated_section
-
-
-def _canonical_numeric_tokens(text):
-    import re
-
-    value = str(text or "")
-
-    # Normaliza decimal comma y espacios alrededor del %
-    value = value.replace(",", ".")
-
-    tokens = set()
-
-    # 42.9%, 42.9 %, 500, 0.001, etc.
-    for match in re.finditer(
-        r"(?<![\w.])[-+]?\d+(?:\.\d+)?\s*%?",
-        value,
-    ):
-        token = match.group(0).strip()
-        token = re.sub(r"\s+", "", token)
-
-        if token:
-            tokens.add(token)
-
-    # Formato invertido poco habitual: %42.9
-    for match in re.finditer(
-        r"%\s*[-+]?\d+(?:\.\d+)?",
-        value,
-    ):
-        token = match.group(0)
-        token = token.replace("%", "").strip()
-        token = re.sub(r"\s+", "", token)
-
-        if token:
-            tokens.add(token + "%")
-
-    return tokens
-
-
-def validate_generated_section(
-    generated,
-    section,
-    evidence,
-):
-    result = _validate_generated_section_original(
-        generated,
-        section,
-        evidence,
-    )
-
-    if not isinstance(result, dict):
-        return result
-
-    numeric_errors = list(
-        result.get("numeric_errors") or []
-    )
-
-    if not numeric_errors:
-        return result
-
-    evidence_tokens = build_section_evidence_numeric_tokens(evidence)
-
-    retained_numeric_errors = []
-
-    for error in numeric_errors:
-
-        prefix = "UNSUPPORTED_NUMERIC_VALUE:"
-
-        if not str(error).startswith(prefix):
-            retained_numeric_errors.append(error)
-            continue
-
-        raw_number = str(error)[len(prefix):].strip()
-
-        target_tokens = _canonical_numeric_tokens(
-            raw_number
-        )
-
-        # Solo se perdona el error si el valor está realmente
-        # presente en la evidencia usada por esta sección.
-        if target_tokens & evidence_tokens:
-            continue
-
-        retained_numeric_errors.append(error)
-
-    old_numeric = set(numeric_errors)
-    removed_numeric = old_numeric - set(
-        retained_numeric_errors
-    )
-
-    result["numeric_errors"] = retained_numeric_errors
-
-    # validation_errors/errors pueden contener el mismo código.
-    for key in ("errors", "validation_errors"):
-        if isinstance(result.get(key), list):
-            result[key] = [
-                item
-                for item in result[key]
-                if item not in removed_numeric
-            ]
-
-    result["validation_ok"] = not any(
-        [
-            result.get("errors"),
-            result.get("validation_errors"),
-            result.get("citation_errors"),
-            result.get("claim_errors"),
-            result.get("numeric_errors"),
-        ]
-    )
-
-    return result
