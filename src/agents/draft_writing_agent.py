@@ -163,7 +163,7 @@ class DraftWritingAgent:
         target_total_words = int(policy["target_total_words"])
         return assign_section_budgets(sections, target_total_words)
 
-   c# Prepara la búsqueda de evidencia para una sección
+    # Prepara la búsqueda de evidencia para una sección
     # usando los fragmentos disponibles de los papers.
     def _retrieve_section_evidence(
         self,
