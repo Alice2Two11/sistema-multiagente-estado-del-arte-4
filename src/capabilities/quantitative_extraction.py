@@ -111,11 +111,11 @@ class QuantitativeExtractionCapability:
                         tool_usage=ToolUsage(), attempt_number=1, started_at=started,
                         completed_at=datetime.now(timezone.utc).isoformat(), error=None,
                     )
-            # Decide si se repararán únicamente las tablas derivadas
+            # Decide si se repararán únicamente las tablas 
             # o si debe ejecutarse nuevamente la extracción con el LLM.
             preserve_sources = bool(policy["deterministic_flattening_repair"])
-            # Si solo se necesita reparar el aplanamiento, reutiliza los JSON originales y no vuelve a consultar al LLM.
-            #usa cuando la extracción original del LLM ya existe y se considera válida, pero hubo un problema en cómo esos JSON se transformaron en las tablas derivadas.
+            # Si la extracción original del LLM ya es válida pero las tablas derivadas
+# necesitan corregirse, reutiliza los JSON existentes sin volver a llamar al LLM.
             if preserve_sources:
                 structured_path = output_dir / ARTIFACT_FILENAMES[0]
                 raw_path = output_dir / ARTIFACT_FILENAMES[1]
