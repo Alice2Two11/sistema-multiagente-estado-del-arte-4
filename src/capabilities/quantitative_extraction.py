@@ -1,3 +1,9 @@
+# ============================================================
+# 03B - EXTRACCIÓN CUANTITATIVA DE EVIDENCIA CIENTÍFICA
+# Identifica y estructura métricas, valores numéricos, datasets
+# y resultados cuantitativos respaldados por los papers.
+# ============================================================
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -23,14 +29,16 @@ from src.tools.quantitative_extraction.evidence_verification import verify_quant
 from src.tools.quantitative_extraction.quality import calculate_diagnostic_metrics, diagnostic_quality_status
 from src.tools.quantitative_extraction.artifacts import write_quantitative_artifacts
 
-
+# Define las dependencias externas que necesita la extracción cuantitativa:
+# el LLM, la fábrica de mensajes y el parser que interpreta la respuesta JSON.
 @dataclass(frozen=True)
 class QuantitativeExtractionDependencies:
     llm: Any
     human_message_factory: Callable[..., Any]
     json_parser: Callable[[str], Any]
 
-
+#crea una huella reproducible de la ejecución de 03B para detectar si cambiaron las entradas, 
+#las reglas, el modelo o alguna versión importante del procesamiento.
 def build_quantitative_composite_fingerprint(agent_input: AgentInput, policy):
     return build_stage_fingerprints(
         input_data={"experiment_id": agent_input.experiment_id, "run_id": agent_input.run_id},
@@ -44,7 +52,8 @@ def build_quantitative_composite_fingerprint(agent_input: AgentInput, policy):
         dependencies_data={k: v.to_dict() for k, v in agent_input.dependencies.items()},
     )
 
-
+# Lee un archivo JSONL línea por línea y convierte cada registro
+# válido en un diccionario de Python.
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     records = []
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -52,7 +61,9 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
             records.append(json.loads(line))
     return records
 
-
+# Ejecuta toda la capacidad de extracción cuantitativa:
+# valida entradas, extrae o reutiliza resultados, verifica los datos,
+# genera métricas, guarda artefactos y devuelve el resultado de 03B.
 class QuantitativeExtractionCapability:
     def __init__(self, dependencies: QuantitativeExtractionDependencies):
         self.dependencies = dependencies
